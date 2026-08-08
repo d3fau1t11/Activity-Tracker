@@ -218,9 +218,6 @@ Activity Tracker CLI/
 └── README.md                      # This file
 ```
 
-## License
-
-
 ## Contributing
 
-Contributions are welcome! Please ensure sensitive configuration files are never committed.
+Contributions are welcome! 
