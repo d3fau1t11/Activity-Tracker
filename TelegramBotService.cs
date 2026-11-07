@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
@@ -60,8 +61,8 @@ namespace Activity_Tracker
 
             // Load optional configuration with defaults
             _enablePrivacyMode = config.GetValue("Telegram:EnablePrivacyMode", false);
-            _maxMessageLength = config.GetValue("Telegram:MaxMessageLength", 1000);
-            _timeout = TimeSpan.FromSeconds(config.GetValue("Telegram:TimeoutSeconds", 30));
+            _maxMessageLength = Math.Clamp(config.GetValue("Telegram:MaxMessageLength", 1000), 512, 4096);
+            _timeout = TimeSpan.FromSeconds(Math.Clamp(config.GetValue("Telegram:TimeoutSeconds", 30), 1, 300));
 
             // Load Privacy configurations
             _hashWindowTitles = config.GetValue("Privacy:HashWindowTitles", false);
@@ -127,7 +128,7 @@ namespace Activity_Tracker
                     report.Id, report.AppName);
 
                 var message = FormatMessage(report);
-                var success = await SendTelegramMessageAsync(message, isPreEscaped: true, cancellationToken);
+                var success = await SendTelegramMessageAsync(message, isPreEscaped: true, cancellationToken, parseMode: "HTML", deliveryId: report.Id);
 
                 if (success)
                 {
@@ -149,7 +150,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error sending report {Id}", report.Id);
+                _logger.LogError("❌ Error sending report {Id} ({ErrorType})", report.Id, ex.GetType().Name);
                 return false;
             }
         }
@@ -163,7 +164,46 @@ namespace Activity_Tracker
             return await SendTelegramMessageAsync(message, isPreEscaped: false, cancellationToken);
         }
 
+        /// <summary>Digests use plain text so application names cannot inject formatting.</summary>
+        public async Task<bool> SendDailyDigestAsync(string message, CancellationToken cancellationToken = default, DateOnly? digestDate = null)
+        {
+            try
+            {
+                var payload = new { chat_id = _chatId, text = message, disable_web_page_preview = true };
+                using var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+                using var request = new HttpRequestMessage(HttpMethod.Post, $"{TelegramApiBaseUrl}{_botToken}/sendMessage") { Content = content };
+                if (digestDate.HasValue)
+                {
+                    var hash = System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(
+                        $"daily-digest:{_chatId}:{Environment.MachineName}:{Environment.UserName}:{digestDate:yyyy-MM-dd}"));
+                    request.Headers.Add("X-Activity-Delivery-Id", new Guid(hash.AsSpan(0, 16)).ToString("N"));
+                }
+                using var response = await _httpClient.SendAsync(request, cancellationToken);
+                var success = await IsSuccessfulResponseAsync(response, cancellationToken);
+                if (!success)
+                    _logger.LogWarning("Daily digest send failed with HTTP {Status}", response.StatusCode);
+                return success;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("Daily digest send failed ({ErrorType})", ex.GetType().Name);
+                return false;
+            }
+        }
+
         #endregion
+
+        /// <summary>Use the same title privacy rules for every outgoing activity view.</summary>
+        public string FormatWindowTitle(string windowTitle)
+        {
+            if (string.IsNullOrEmpty(windowTitle)) return windowTitle;
+            if (_enablePrivacyMode) return "[Window Title Hidden for Privacy]";
+            if (_removeSensitiveKeywords && _sensitiveKeywords.Any(k =>
+                windowTitle.Contains(k, StringComparison.OrdinalIgnoreCase)))
+                return _sensitiveReplacementText;
+            return _hashWindowTitles && windowTitle != _sensitiveReplacementText ? HashString(windowTitle) : windowTitle;
+        }
 
         #region Private Methods
 
@@ -172,96 +212,33 @@ namespace Activity_Tracker
         /// </summary>
         private string FormatMessage(ActivityReport report)
         {
-            try
+            // Bound plain values before encoding, never truncate finished markup or entities.
+            string Html(string? value, int limit)
             {
-                // Handle window title privacy
-                string windowTitle = report.WindowTitle;
-                if (_enablePrivacyMode && !string.IsNullOrEmpty(windowTitle))
+                value ??= string.Empty;
+                if (value.Length > limit)
                 {
-                    // Option 1: Replace with generic text
-                    windowTitle = "[Window Title Hidden for Privacy]";
+                    if (char.IsHighSurrogate(value[limit - 1])) limit--;
+                    value = value[..limit] + "...";
                 }
-                else if (!string.IsNullOrEmpty(windowTitle))
-                {
-                    // Option 2: Remove/replace sensitive keywords if found
-                    if (_removeSensitiveKeywords)
-                    {
-                        bool containsSensitive = _sensitiveKeywords.Any(k => 
-                            windowTitle.Contains(k, StringComparison.OrdinalIgnoreCase));
-                        if (containsSensitive)
-                        {
-                            windowTitle = _sensitiveReplacementText;
-                        }
-                    }
+                return WebUtility.HtmlEncode(value);
+            }
+            return $"""
+                <b>Activity Report</b>
 
-                    // Option 3: Hash window title
-                    if (_hashWindowTitles && windowTitle != _sensitiveReplacementText)
-                    {
-                        windowTitle = HashString(windowTitle);
-                    }
-                }
-
-                // ✅ FIXED: Use DurationFormatter here
-                string durationString = DurationFormatter.Format(report.DurationSeconds);
-
-                // Escape variables individually to prevent unclosed formatting tags in titles/apps
-                string escapedAppName = EscapeMarkdown(report.AppName);
-                string escapedWindowTitle = EscapeMarkdown(windowTitle);
-                string escapedDuration = EscapeMarkdown(durationString);
-                string escapedUserName = EscapeMarkdown(report.UserName);
-
-                // Build message
-                var message = $"""
-                🕒 *Activity Report*
-                
-                *User*: `{escapedUserName}`
-                *Application*: `{escapedAppName}`
-                *Window Title*: {escapedWindowTitle}
-                *Duration*: {escapedDuration}
-                *Time*: {report.Timestamp:HH:mm}
-                *Date*: {report.Timestamp:yyyy-MM-dd}
+                <b>User:</b> {Html(report.UserName, 64)}
+                <b>Application:</b> {Html(report.AppName, 96)}
+                <b>Window Title:</b> {Html(FormatWindowTitle(report.WindowTitle), _maxMessageLength - 384)}
+                <b>Duration:</b> {DurationFormatter.Format(report.DurationSeconds)}
+                <b>Time:</b> {report.Timestamp:HH:mm}
+                <b>Date:</b> {report.Timestamp:yyyy-MM-dd}
                 """;
-
-                // Truncate if too long (Telegram has 4096 character limit)
-                if (message.Length > _maxMessageLength)
-                {
-                    message = message.Substring(0, _maxMessageLength - 3) + "...";
-                    _logger.LogDebug("📝 Message truncated to {Length} characters", _maxMessageLength);
-                }
-
-                return message;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "❌ Error formatting message for report {Id}", report.Id);
-                return $"⚠️ Error formatting activity report for {report.AppName}";
-            }
-        }
-
-        /// <summary>
-        /// Escapes markdown special characters for Telegram
-        /// </summary>
-        private string EscapeMarkdown(string text)
-        {
-            if (string.IsNullOrEmpty(text))
-                return string.Empty;
-
-            // Telegram MarkdownV2 requires escaping these characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
-            var specialChars = new[] { '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!' };
-
-            var result = new StringBuilder(text);
-            foreach (var c in specialChars)
-            {
-                result.Replace(c.ToString(), $"\\{c}");
-            }
-
-            return result.ToString();
         }
 
         /// <summary>
         /// Sends a message to Telegram
         /// </summary>
-        private async Task<bool> SendTelegramMessageAsync(string message, bool isPreEscaped = false, CancellationToken cancellationToken = default)
+        private async Task<bool> SendTelegramMessageAsync(string message, bool isPreEscaped = false, CancellationToken cancellationToken = default, string? parseMode = null, Guid? deliveryId = null)
         {
             try
             {
@@ -269,7 +246,7 @@ namespace Activity_Tracker
                 {
                     chat_id = _chatId,
                     text = isPreEscaped ? message : EscapeNonFormattingMarkdown(message),
-                    parse_mode = "MarkdownV2",
+                    parse_mode = parseMode ?? "MarkdownV2",
                     disable_notification = false,
                     disable_web_page_preview = true
                 };
@@ -279,23 +256,21 @@ namespace Activity_Tracker
                     PropertyNamingPolicy = JsonNamingPolicy.CamelCase
                 });
 
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
+                using var content = new StringContent(json, Encoding.UTF8, "application/json");
                 var url = $"{TelegramApiBaseUrl}{_botToken}/sendMessage";
 
-                _logger.LogTrace("🌐 Sending Telegram request to {Url}", url);
 
-                var response = await _httpClient.PostAsync(url, content, cancellationToken);
+                using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+                if (deliveryId.HasValue) request.Headers.Add("X-Activity-Delivery-Id", deliveryId.Value.ToString("N"));
+                using var response = await _httpClient.SendAsync(request, cancellationToken);
 
-                if (response.IsSuccessStatusCode)
+                if (await IsSuccessfulResponseAsync(response, cancellationToken))
                 {
                     _logger.LogTrace("✅ Telegram API responded with success");
                     return true;
                 }
 
-                // Log the error details
-                var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
-                _logger.LogWarning("⚠️ Telegram API error: {StatusCode}, Response: {Response}",
-                    response.StatusCode, responseBody);
+                _logger.LogWarning("Telegram API error: HTTP {StatusCode}", response.StatusCode);
 
                 // Handle specific HTTP status codes
                 switch (response.StatusCode)
@@ -318,12 +293,12 @@ namespace Activity_Tracker
             }
             catch (HttpRequestException ex)
             {
-                _logger.LogError(ex, "🌐 Network error sending to Telegram: {Message}", ex.Message);
+                _logger.LogError("Network error sending to Telegram ({ErrorType})", ex.GetType().Name);
                 return false;
             }
             catch (JsonException ex)
             {
-                _logger.LogError(ex, "📄 JSON serialization error");
+                _logger.LogError("📄 JSON serialization error ({ErrorType})", ex.GetType().Name);
                 return false;
             }
             catch (TaskCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -333,17 +308,24 @@ namespace Activity_Tracker
             }
             catch (TaskCanceledException ex)
             {
-                _logger.LogError(ex, "⏱️ Telegram send timeout after {Timeout}", _timeout);
+                _logger.LogError("⏱️ Telegram send timeout after {Timeout} ({ErrorType})", _timeout, ex.GetType().Name);
                 return false;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Unexpected error sending to Telegram");
+                _logger.LogError("❌ Unexpected error sending to Telegram ({ErrorType})", ex.GetType().Name);
                 return false;
             }
         }
 
         #endregion
+
+        private static async Task<bool> IsSuccessfulResponseAsync(HttpResponseMessage response, CancellationToken token)
+        {
+            if (!response.IsSuccessStatusCode) return false;
+            using var body = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token));
+            return body.RootElement.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.True;
+        }
 
         private static string HashString(string input)
         {

@@ -194,7 +194,7 @@ namespace Activity_Tracker
         public bool IsReadyForRetry()
         {
             if (!ShouldRetry) return false;
-            if (SendAttempts == 0) return true; // Never attempted
+            if (SendAttempts == 0 || !LastSendAttempt.HasValue) return true;
 
             var nextRetry = CalculateNextRetryTime();
             return DateTime.Now >= nextRetry;

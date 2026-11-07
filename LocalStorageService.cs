@@ -23,19 +23,18 @@ namespace Activity_Tracker
         private readonly string _failedFilePath;
         private readonly object _fileLock = new();
 
-        private const int MaxFileSizeMB = 10; // Maximum size for active file before rotation
         private const int MaxArchiveFiles = 10; // Keep last 10 archive files
 
         #endregion
 
         #region Constructor
 
-        public LocalStorageService(ILogger<LocalStorageService>? logger = null)
+        public LocalStorageService(ILogger<LocalStorageService>? logger = null, string? storageDirectory = null)
         {
             _logger = logger;
 
             // Use AppData/Roaming for per-user storage
-            _storageDirectory = Path.Combine(
+            _storageDirectory = storageDirectory ?? Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                 "ActivityTracker"
             );
@@ -82,8 +81,7 @@ namespace Activity_Tracker
 
                     _logger?.LogDebug("💾 Saved report: {Id} ({App})", report.Id, report.AppName);
 
-                    // Check if we need to rotate the file
-                    CheckAndRotateFile(_activeFilePath);
+                    // Pending records must remain reachable until delivery; do not rotate the queue.
                 }
                 catch (Exception ex)
                 {
@@ -134,14 +132,14 @@ namespace Activity_Tracker
         /// <summary>
         /// Gets all reports that are pending to be sent
         /// </summary>
-        public List<ActivityReport> GetPendingReports(int maxRetryAttempts)
+        public List<ActivityReport> GetPendingReports(int maxRetryAttempts, bool readyOnly = false)
         {
             lock (_fileLock)
             {
                 var reports = LoadActiveReports();
 
                 return reports
-                    .Where(r => !r.Sent && r.SendAttempts < maxRetryAttempts)
+                    .Where(r => !r.Sent && r.SendAttempts < maxRetryAttempts && (!readyOnly || r.IsReadyForRetry()))
                     .OrderBy(r => r.Timestamp) // Oldest first
                     .ToList();
             }
@@ -156,15 +154,16 @@ namespace Activity_Tracker
             {
                 try
                 {
-                    // Remove from active reports
+                    // Write the destination first so an archive failure cannot destroy the source.
+                    var sentReports = LoadSentReports();
+                    sentReports.RemoveAll(r => r.Id == report.Id);
+                    report.Sent = true;
+                    sentReports.Add(report);
+                    SaveReportsToFile(sentReports, _sentFilePath);
+
                     var activeReports = LoadActiveReports();
                     activeReports.RemoveAll(r => r.Id == report.Id);
                     SaveReportsToFile(activeReports, _activeFilePath);
-
-                    // Add to sent archive
-                    var sentReports = LoadSentReports();
-                    sentReports.Add(report);
-                    SaveReportsToFile(sentReports, _sentFilePath);
 
                     _logger?.LogDebug("📦 Archived sent report: {Id}", report.Id);
 
@@ -174,6 +173,7 @@ namespace Activity_Tracker
                 catch (Exception ex)
                 {
                     _logger?.LogError(ex, "❌ Failed to archive report {Id}", report.Id);
+                    throw;
                 }
             }
         }
@@ -187,15 +187,15 @@ namespace Activity_Tracker
             {
                 try
                 {
-                    // Remove from active reports
+                    // Preserve the source until the failed archive has been written successfully.
+                    var failedReports = LoadFailedReports();
+                    failedReports.RemoveAll(r => r.Id == report.Id);
+                    failedReports.Add(report);
+                    SaveReportsToFile(failedReports, _failedFilePath);
+
                     var activeReports = LoadActiveReports();
                     activeReports.RemoveAll(r => r.Id == report.Id);
                     SaveReportsToFile(activeReports, _activeFilePath);
-
-                    // Add to failed reports
-                    var failedReports = LoadFailedReports();
-                    failedReports.Add(report);
-                    SaveReportsToFile(failedReports, _failedFilePath);
 
                     _logger?.LogWarning("🚫 Moved to failed queue: {Id} ({App})", report.Id, report.AppName);
 
@@ -205,6 +205,7 @@ namespace Activity_Tracker
                 catch (Exception ex)
                 {
                     _logger?.LogError(ex, "❌ Failed to move report to failed queue: {Id}", report.Id);
+                    throw;
                 }
             }
         }
@@ -220,12 +221,11 @@ namespace Activity_Tracker
                 {
                     // Cleanup active reports (keep pending reports regardless of age)
                     var activeReports = LoadActiveReports();
-                    var activePending = activeReports.Where(r => !r.Sent).ToList();
                     var activeOld = activeReports.Where(r => r.Sent && (DateTime.Now - r.CreatedAt) > maxAge).ToList();
 
                     if (activeOld.Any())
                     {
-                        activeReports = activePending;
+                        activeReports = activeReports.Where(r => !r.Sent || DateTime.Now - r.CreatedAt <= maxAge).ToList();
                         SaveReportsToFile(activeReports, _activeFilePath);
                         _logger?.LogInformation("🧹 Cleaned up {Count} old active reports", activeOld.Count);
                     }
@@ -249,6 +249,47 @@ namespace Activity_Tracker
         #endregion
 
         #region Query Methods
+
+        public void ReconcileCompletedReports()
+        {
+            lock (_fileLock)
+            {
+                foreach (var report in LoadActiveReports())
+                {
+                    if (report.Sent) ArchiveReport(report);
+                    else if (report.SendAttempts >= 10) MoveToFailed(report);
+                }
+            }
+        }
+
+        /// <summary>All retained completed sessions, independent of delivery status.</summary>
+        public List<ActivityReport> GetReportHistory()
+        {
+            lock (_fileLock)
+            {
+                var reports = LoadSentReports().Concat(LoadActiveReports()).Concat(LoadFailedReports()).ToList();
+                return reports.DistinctBy(r => r.Id).OrderBy(r => r.Timestamp).ToList();
+            }
+        }
+
+        public DateOnly? LoadDigestDate()
+        {
+            lock (_fileLock)
+            {
+                var path = Path.Combine(_storageDirectory, "daily_digest.json");
+                return File.Exists(path) ? JsonSerializer.Deserialize<DateOnly>(File.ReadAllText(path)) : null;
+            }
+        }
+
+        public void SaveDigestDate(DateOnly date)
+        {
+            lock (_fileLock)
+            {
+                var path = Path.Combine(_storageDirectory, "daily_digest.json");
+                File.WriteAllText(path + ".tmp", JsonSerializer.Serialize(date));
+                File.Move(path + ".tmp", path, overwrite: true);
+            }
+        }
 
         /// <summary>
         /// Gets statistics about stored reports
@@ -323,7 +364,19 @@ namespace Activity_Tracker
         /// </summary>
         private List<ActivityReport> LoadActiveReports()
         {
-            return LoadReportsFromFile(_activeFilePath);
+            var reports = LoadReportsFromFile(_activeFilePath);
+            var legacyFiles = Directory.GetFiles(_storageDirectory, "active_reports_*.json");
+            if (legacyFiles.Length == 0) return reports;
+
+            // Older builds rotated pending files but never retried their contents.
+            // Commit the merged queue before renaming any original into a recovery backup.
+            var completed = LoadSentReports().Concat(LoadFailedReports()).Select(r => r.Id).ToHashSet();
+            foreach (var file in legacyFiles) reports.AddRange(LoadReportsFromFile(file));
+            reports = reports.Where(r => !completed.Contains(r.Id)).GroupBy(r => r.Id)
+                .Select(g => g.OrderByDescending(r => r.Sent).ThenByDescending(r => r.SendAttempts).First()).ToList();
+            SaveReportsToFile(reports, _activeFilePath);
+            foreach (var file in legacyFiles) File.Move(file, $"{file}.{Guid.NewGuid():N}.recovered");
+            return reports;
         }
 
         /// <summary>
@@ -353,8 +406,7 @@ namespace Activity_Tracker
             try
             {
                 var json = File.ReadAllText(filePath);
-                if (string.IsNullOrWhiteSpace(json))
-                    return new List<ActivityReport>();
+                if (string.IsNullOrWhiteSpace(json)) throw new JsonException("The report file is empty.");
 
                 var options = new JsonSerializerOptions
                 {
@@ -363,7 +415,8 @@ namespace Activity_Tracker
                 };
 
                 var reports = JsonSerializer.Deserialize<List<ActivityReport>>(json, options);
-                return reports ?? new List<ActivityReport>();
+                if (reports == null || reports.Any(r => r == null)) throw new JsonException("Expected an array of reports.");
+                return reports;
             }
             catch (JsonException ex)
             {
@@ -372,12 +425,12 @@ namespace Activity_Tracker
                 // Backup corrupted file
                 BackupCorruptedFile(filePath);
 
-                return new List<ActivityReport>();
+                throw;
             }
             catch (Exception ex)
             {
                 _logger?.LogError(ex, "❌ Failed to load reports from {File}", filePath);
-                return new List<ActivityReport>();
+                throw;
             }
         }
 
@@ -445,44 +498,13 @@ namespace Activity_Tracker
                 if (!File.Exists(filePath))
                     return;
 
-                var backupPath = $"{filePath}.corrupted.{DateTime.Now:yyyyMMddHHmmss}";
-                File.Move(filePath, backupPath);
+                var backupPath = $"{filePath}.corrupted";
+                if (!File.Exists(backupPath)) File.Copy(filePath, backupPath);
                 _logger?.LogWarning("📂 Backed up corrupted file to: {Backup}", backupPath);
             }
             catch (Exception ex)
             {
                 _logger?.LogError(ex, "❌ Failed to backup corrupted file");
-            }
-        }
-
-        /// <summary>
-        /// Checks if file needs rotation and rotates if necessary
-        /// </summary>
-        private void CheckAndRotateFile(string filePath)
-        {
-            try
-            {
-                if (!File.Exists(filePath))
-                    return;
-
-                var fileInfo = new FileInfo(filePath);
-                if (fileInfo.Length > MaxFileSizeMB * 1024 * 1024)
-                {
-                    // Rotate file
-                    var timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
-                    var rotatedFile = Path.Combine(
-                        Path.GetDirectoryName(filePath)!,
-                        $"{Path.GetFileNameWithoutExtension(filePath)}_{timestamp}.json"
-                    );
-
-                    File.Move(filePath, rotatedFile);
-                    _logger?.LogInformation("🔄 Rotated file: {Original} → {Rotated}",
-                        Path.GetFileName(filePath), Path.GetFileName(rotatedFile));
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex, "❌ Failed to rotate file");
             }
         }
 
@@ -493,7 +515,7 @@ namespace Activity_Tracker
         {
             try
             {
-                var archiveFiles = Directory.GetFiles(_storageDirectory, "active_reports_*.json")
+                var archiveFiles = Directory.GetFiles(_storageDirectory, "active_reports_*.recovered")
                     .OrderByDescending(f => f)
                     .Skip(MaxArchiveFiles)
                     .ToList();
@@ -606,7 +628,7 @@ namespace Activity_Tracker
                     {
                         _logger?.LogWarning("⚠️ Invalid JSON in: {File}", Path.GetFileName(file));
                         BackupCorruptedFile(file);
-                        File.WriteAllText(file, "[]"); // Reset to empty array
+                        throw new JsonException($"Storage file is corrupted: {Path.GetFileName(file)}");
                     }
                 }
             }

@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Configuration;
 using FlashCap;
 using System.IO;
 using System.Linq;
@@ -26,17 +27,16 @@ public class Worker : BackgroundService
     private readonly LocalStorageService _storageService;
     private readonly IHostApplicationLifetime _appLifetime;
 
-    private AppSession? _currentSession;
-    private readonly TimeSpan _minSessionDuration = TimeSpan.FromSeconds(15);
-    private readonly TimeSpan _checkInterval = TimeSpan.FromSeconds(2); // More responsive than 10s
+    private readonly ActivitySessionTracker _tracking;
+    private readonly ReportDeliveryService _delivery;
+    private readonly TimeSpan _checkInterval;
+    private readonly bool _ignoreSystemProcesses;
+    private readonly HashSet<string> _ignoredProcesses;
+    private readonly object _sessionLock = new();
+    private readonly SemaphoreSlim _reportQueued = new(0, 1);
+    private Task? _syncTask;
 
-    private string _lastAppName = string.Empty;
-    private string _lastWindowTitle = string.Empty;
-    private bool _isTrackingEnabled = false; // Track whether monitoring is active
-    
-    private readonly TimeSpan _maxIdleTime = TimeSpan.FromMinutes(3); // Idle threshold (AFK)
-    private bool _isIdle = false;
-    private DateTime? _idleStartTime;
+    private readonly TimeSpan _maxIdleTime;
 
     // Performance optimization: reuse StringBuilder
     private readonly StringBuilder _windowTitleBuffer = new(256);
@@ -51,7 +51,7 @@ public class Worker : BackgroundService
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
 
     [DllImport("user32.dll")]
@@ -121,12 +121,24 @@ public class Worker : BackgroundService
         ILogger<Worker> logger,
         TelegramBotService telegramService,
         LocalStorageService storageService,
-        IHostApplicationLifetime appLifetime)
+        IHostApplicationLifetime appLifetime,
+        IConfiguration configuration,
+        ReportDeliveryService delivery)
     {
         _logger = logger;
         _telegramService = telegramService ?? throw new ArgumentNullException(nameof(telegramService));
         _storageService = storageService ?? throw new ArgumentNullException(nameof(storageService));
         _appLifetime = appLifetime;
+        _delivery = delivery;
+        _checkInterval = TimeSpan.FromSeconds(Math.Clamp(configuration.GetValue("Worker:CheckIntervalSeconds", 2), 1, 300));
+        var minimumDuration = TimeSpan.FromSeconds(Math.Clamp(configuration.GetValue("Worker:MinSessionDurationSeconds", 15), 1, 3600));
+        _maxIdleTime = TimeSpan.FromSeconds(Math.Clamp(configuration.GetValue("Worker:IdleThresholdSeconds", 180), 10, 86400));
+        _tracking = new ActivitySessionTracker(minimumDuration, _maxIdleTime,
+            TimeSpan.FromSeconds(Math.Max(30, _checkInterval.TotalSeconds * 3)));
+        _ignoreSystemProcesses = configuration.GetValue("Worker:IgnoreSystemProcesses", true);
+        _ignoredProcesses = configuration.GetSection("Worker:IgnoreProcesses").GetChildren()
+            .Select(c => c.Value).OfType<string>().Select(p => p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? p : p + ".exe")
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         try
         {
@@ -180,277 +192,108 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("👁️ Window Monitor Worker starting...");
-
-        // Initial delay to let other services start
-        await Task.Delay(TimeSpan.FromSeconds(2), stoppingToken);
-
-        _logger.LogInformation("👁️ Worker ready. Tracking is currently DISABLED.");
-
-        // Start background periodic sync task
-        _ = RunBackgroundSyncLoopAsync(stoppingToken);
-
+        _logger.LogInformation("Window monitor starting; tracking begins paused.");
+        _syncTask = RunBackgroundSyncLoopAsync(stoppingToken);
         try
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                if (IsActiveConsoleSession())
+                try
                 {
-                    // Enforce the application block list
-                    EnforceAppBlockList();
-
-                    // Enforce the website domain block list
-                    EnforceWebBlockList();
-
-                    // Only monitor if tracking is enabled
-                    if (_isTrackingEnabled)
+                    if (IsActiveConsoleSession())
                     {
-                        await MonitorWindowChangesAsync(stoppingToken);
+                        EnforceAppBlockList();
+                        EnforceWebBlockList();
+                        if (IsTrackingEnabled) MonitorWindowChanges(stoppingToken);
                     }
                     else
                     {
-                        // If tracking is disabled, just sleep to avoid CPU usage
-                        await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                        lock (_sessionLock)
+                            _tracking.Observe(DateTime.Now, string.Empty, string.Empty, TimeSpan.Zero, sessionActive: false);
                     }
+                    SavePendingSessions();
                 }
-                else
+                catch (Exception ex)
                 {
-                    // If we became inactive but still have a session, end it gracefully
-                    if (_currentSession != null)
-                    {
-                        _logger.LogInformation("👤 Session became inactive due to user switch. Ending current tracking session.");
-                        await EndCurrentSessionAsync();
-                    }
-
-                    // Sleep longer to avoid CPU usage when backgrounded
-                    await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
-                    continue; // Skip the regular check interval delay
+                    _logger.LogError(ex, "Window monitoring cycle failed; retrying on the next poll.");
                 }
-
                 await Task.Delay(_checkInterval, stoppingToken);
             }
         }
-        catch (TaskCanceledException)
-        {
-            // Normal shutdown
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "❌ Error in window monitoring");
-            // Don't crash the service, continue monitoring
-        }
-
-        _logger.LogInformation("👁️ Window Monitor Worker stopping...");
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
     }
 
     /// <summary>
     /// Monitors for window changes and handles session tracking
     /// </summary>
-    private async Task MonitorWindowChangesAsync(CancellationToken stoppingToken)
+    private void MonitorWindowChanges(CancellationToken stoppingToken)
     {
-        try
+        lock (_sessionLock)
         {
-            // 1. Check if user is currently idle (AFK)
-            if (IsUserIdle(out double idleSeconds))
+            if (!_tracking.Enabled || stoppingToken.IsCancellationRequested) return;
+            try
             {
-                if (!_isIdle)
+                var observedAt = DateTime.Now;
+                var idle = IsUserIdle(out double idleSeconds);
+                var idleTime = TimeSpan.FromSeconds(idleSeconds);
+                if (idle)
                 {
-                    _isIdle = true;
-                    _idleStartTime = DateTime.Now.AddSeconds(-idleSeconds);
-                    _logger.LogInformation("⏸️ User is IDLE (AFK for {IdleTime}s). Pausing session tracking.", (int)idleSeconds);
-                    
-                    if (_currentSession != null)
-                    {
-                        // Backdate session end time to the exact last input moment
-                        _currentSession.EndTime = _idleStartTime.Value;
-                        await EndCurrentSessionAsync();
-                    }
+                    _tracking.Observe(observedAt, string.Empty, string.Empty, idleTime);
+                    return;
                 }
-                return; // Suppress window changes while user is idle
-            }
+                var (hwnd, appName, windowTitle) = GetActiveWindowInfo();
 
-            // User has returned from idle state
-            if (_isIdle)
-            {
-                _isIdle = false;
-                if (_idleStartTime.HasValue)
-                {
-                    var idleDuration = DateTime.Now - _idleStartTime.Value;
-                    _logger.LogInformation("▶| User returned after being idle for {IdleTime}s", (int)idleDuration.TotalSeconds);
-                }
-                _idleStartTime = null;
-            }
-
-            var (hwnd, appName, windowTitle) = GetActiveWindowInfo();
-
-            // Skip if we couldn't get window info
-            if (string.IsNullOrEmpty(appName))
-            {
-                // Reset current session if window is lost
-                if (_currentSession != null)
-                {
-                    await EndCurrentSessionAsync();
-                }
-                return;
-            }
-
-            // Extract active URL from browser if applicable
-            string? activeUrl = BrowserUrlExtractor.GetActiveTabUrl(hwnd, appName);
-            if (!string.IsNullOrEmpty(activeUrl))
-            {
-                try
-                {
-                    var uri = new Uri(activeUrl);
-                    string host = uri.Host.StartsWith("www.", StringComparison.OrdinalIgnoreCase) 
-                        ? uri.Host.Substring(4) 
-                        : uri.Host;
-                    
-                    string path = uri.PathAndQuery;
-                    if (path == "/") path = "";
-
-                    string cleanUrlDisplay = host + path;
-                    if (cleanUrlDisplay.Length > 40)
-                    {
-                        cleanUrlDisplay = cleanUrlDisplay.Substring(0, 37) + "...";
-                    }
-
-                    // Format as: "Title [domain.com/path]"
-                    windowTitle = $"{windowTitle} [{cleanUrlDisplay}]";
-                }
-                catch
-                {
-                    windowTitle = $"{windowTitle} [{activeUrl}]";
-                }
-            }
-
-            // Check for significant changes
-            bool isNewSession = false;
-
-            // Determine if we need to start a new session
-            if (_currentSession == null)
-            {
-                isNewSession = true;
-            }
-            else if (_currentSession.AppName != appName || _currentSession.WindowTitle != windowTitle)
-            {
-                // App or title changed - end current session
-                await EndCurrentSessionAsync();
-                isNewSession = true;
-            }
-
-            // Start new session if needed
-            if (isNewSession)
-            {
-                _currentSession = new AppSession
-                {
-                    AppName = appName,
-                    WindowTitle = windowTitle,
-                    StartTime = DateTime.Now
-                };
-
-                _logger.LogDebug(
-                    "▶️ Session Started → {App} | Title: {Title}",
-                    appName,
-                    string.IsNullOrEmpty(windowTitle) ? "[No Title]" : Truncate(windowTitle, 50)
-                );
-            }
-
-            // Update tracking variables
-            _lastAppName = appName;
-            _lastWindowTitle = windowTitle;
-
-            // Update session end time (for duration calculation)
-            if (_currentSession != null)
-            {
-                _currentSession.EndTime = DateTime.Now;
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "❌ Error in window monitoring cycle");
-        }
-    }
-
-    /// <summary>
-    /// Ends the current session and queues it for reporting
-    /// </summary>
-    private async Task EndCurrentSessionAsync()
-    {
-        if (_currentSession == null) return;
-
-        try
-        {
-            // Set end time
-            _currentSession.EndTime = DateTime.Now;
-            var duration = _currentSession.Duration;
-
-            // Format duration for logging
-            string durationFormatted = DurationFormatter.Format((int)duration.TotalSeconds);
-
-            // Check minimum duration
-            if (duration >= _minSessionDuration)
-            {
-                _logger.LogInformation(
-                    "⏹️ Session Ended → {App} | Duration: {Duration}",
-                    _currentSession.AppName,
-                    durationFormatted
-                );
-
-                // Create the report
-                var report = ActivityReport.FromSession(_currentSession);
-
-                // ✅ Save to local storage first (data safety)
-                _storageService.Save(report);
-                _logger.LogDebug("💾 Saved report to local storage: {App}", report.AppName);
-
-                // ✅ Check internet and try to send immediately
-                if (IsInternetAvailable())
+                // Extract active URL from browser if applicable
+                string? activeUrl = BrowserUrlExtractor.GetActiveTabUrl(hwnd, appName);
+                if (!string.IsNullOrEmpty(activeUrl))
                 {
                     try
                     {
-                        bool sent = await _telegramService.SendReportAsync(report);
-                        if (sent)
+                        var uri = new Uri(activeUrl);
+                        string host = uri.Host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+                            ? uri.Host.Substring(4)
+                            : uri.Host;
+
+                        string path = uri.PathAndQuery;
+                        if (path == "/") path = "";
+
+                        string cleanUrlDisplay = host + path;
+                        if (cleanUrlDisplay.Length > 40)
                         {
-                            report.Sent = true;
-                            report.RecordSendAttempt(true);
-                            _storageService.ArchiveReport(report); // Archive successfully sent report
-                            _logger.LogDebug("✅ Report sent successfully to Telegram");
+                            cleanUrlDisplay = cleanUrlDisplay.Substring(0, 37) + "...";
                         }
-                        else
-                        {
-                            _logger.LogWarning("⚠️ Failed to send report to Telegram (will store locally)");
-                            report.RecordSendAttempt(false, "Telegram send failed");
-                            _storageService.Save(report);
-                        }
+
+                        // Format as: "Title [domain.com/path]"
+                        windowTitle = $"{windowTitle} [{cleanUrlDisplay}]";
                     }
-                    catch (Exception ex)
+                    catch
                     {
-                        _logger.LogError(ex, "❌ Error sending to Telegram");
-                        report.RecordSendAttempt(false, ex.Message);
-                        _storageService.Save(report);
+                        windowTitle = $"{windowTitle} [{activeUrl}]";
                     }
                 }
-                else
-                {
-                    _logger.LogWarning("📶 Offline - Report stored locally. Will send when online.");
-                }
+
+                _tracking.Observe(observedAt, appName, windowTitle, idleTime);
             }
-            else
+            catch (Exception ex)
             {
-                _logger.LogDebug(
-                    "⏩ Skipped short session → {App} | Duration: {Duration}",
-                    _currentSession.AppName,
-                    durationFormatted
-                );
+                _logger.LogError(ex, "❌ Error in window monitoring cycle");
             }
         }
-        catch (Exception ex)
+    }
+
+    private void SavePendingSessions()
+    {
+        lock (_sessionLock)
         {
-            _logger.LogError(ex, "❌ Error ending session for {App}", _currentSession.AppName);
-        }
-        finally
-        {
-            _currentSession = null;
+            try
+            {
+                if (_tracking.SavePending(_storageService.Save) > 0)
+                    try { _reportQueued.Release(); } catch (SemaphoreFullException) { }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not save completed sessions; retaining them for the next attempt.");
+            }
         }
     }
 
@@ -458,36 +301,17 @@ public class Worker : BackgroundService
 
     #region Control Methods (for Telegram commands)
 
-    /// <summary>
-    /// Starts tracking activity
-    /// </summary>
     public void StartTracking()
     {
-        if (!_isTrackingEnabled)
-        {
-            _isTrackingEnabled = true;
-            _isIdle = false;
-            _idleStartTime = null;
-            _logger.LogInformation("▶️ Tracking STARTED");
-        }
+        lock (_sessionLock) _tracking.Start();
+        _logger.LogInformation("Tracking started.");
     }
 
-    /// <summary>
-    /// Stops tracking activity
-    /// </summary>
     public void StopTracking()
     {
-        if (_isTrackingEnabled)
-        {
-            // End any active session before stopping
-            if (_currentSession != null)
-            {
-                EndCurrentSessionAsync().Wait(TimeSpan.FromSeconds(5));
-            }
-
-            _isTrackingEnabled = false;
-            _logger.LogInformation("⏸️ Tracking STOPPED");
-        }
+        lock (_sessionLock) _tracking.Stop(DateTime.Now);
+        SavePendingSessions();
+        _logger.LogInformation("Tracking paused.");
     }
 
     /// <summary>
@@ -569,12 +393,12 @@ public class Worker : BackgroundService
     /// <summary>
     /// Gets whether the user is currently detected as idle (AFK)
     /// </summary>
-    public bool IsIdle => _isIdle;
+    public bool IsIdle { get { lock (_sessionLock) return _tracking.IsIdle; } }
 
     /// <summary>
     /// Gets the current tracking status
     /// </summary>
-    public bool IsTrackingEnabled => _isTrackingEnabled;
+    public bool IsTrackingEnabled { get { lock (_sessionLock) return _tracking.Enabled; } }
 
     /// <summary>
     /// Gets statistics about tracked activities
@@ -587,7 +411,7 @@ public class Worker : BackgroundService
                $"Pending: {stats.PendingCount}\n" +
                $"Sent: {stats.SentCount}\n" +
                $"Failed: {stats.FailedCount}\n" +
-               $"Tracking: {(_isTrackingEnabled ? (_isIdle ? "IDLE (AFK) 💤" : "ON ✅") : "OFF ⏸️")}";
+               $"Tracking: {(IsTrackingEnabled ? (IsIdle ? "IDLE (AFK) 💤" : "ON ✅") : "OFF ⏸️")}";
     }
 
     /// <summary>
@@ -1459,6 +1283,8 @@ public class Worker : BackgroundService
     /// </summary>
     private bool ShouldIgnoreProcess(string processName)
     {
+        if (_ignoredProcesses.Contains(processName)) return true;
+        if (!_ignoreSystemProcesses) return false;
         // List of system processes to ignore
         string[] ignoredProcesses =
         {
@@ -1520,14 +1346,14 @@ public class Worker : BackgroundService
             try
             {
                 // Sleep for 30 seconds between syncs to be responsive
-                await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
+                await _reportQueued.WaitAsync(TimeSpan.FromSeconds(30), stoppingToken);
 
                 if (IsInternetAvailable())
                 {
                     await SyncPendingReportsAsync(stoppingToken);
                 }
             }
-            catch (TaskCanceledException)
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
@@ -1541,74 +1367,8 @@ public class Worker : BackgroundService
     /// <summary>
     /// Syncs all pending reports to Telegram
     /// </summary>
-    public async Task<int> SyncPendingReportsAsync(CancellationToken stoppingToken = default)
-    {
-        int successfullySent = 0;
-        try
-        {
-            // Load pending reports with up to 10 retry attempts
-            var pending = _storageService.GetPendingReports(10);
-            if (!pending.Any()) return 0;
-
-            _logger.LogInformation("🔄 Syncing {Count} pending reports to Telegram...", pending.Count);
-
-            foreach (var report in pending)
-            {
-                if (stoppingToken.IsCancellationRequested) break;
-
-                try
-                {
-                    bool sent = await _telegramService.SendReportAsync(report);
-                    if (sent)
-                    {
-                        report.Sent = true;
-                        report.RecordSendAttempt(true);
-                        _storageService.ArchiveReport(report);
-                        successfullySent++;
-                        _logger.LogDebug("✅ Synced report for {App}", report.AppName);
-                    }
-                    else
-                    {
-                        report.RecordSendAttempt(false, "Sync send failed");
-                        if (report.SendAttempts >= 10)
-                        {
-                            _storageService.MoveToFailed(report);
-                        }
-                        else
-                        {
-                            _storageService.Save(report);
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "❌ Failed to sync report {Id}", report.Id);
-                    report.RecordSendAttempt(false, ex.Message);
-                    if (report.SendAttempts >= 10)
-                    {
-                        _storageService.MoveToFailed(report);
-                    }
-                    else
-                    {
-                        _storageService.Save(report);
-                    }
-                }
-
-                // Short delay to respect API limits
-                await Task.Delay(TimeSpan.FromMilliseconds(500), stoppingToken);
-            }
-
-            if (successfullySent > 0)
-            {
-                _logger.LogInformation("✅ Sync complete. Successfully sent {Count} reports.", successfullySent);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "❌ Error during sync operation");
-        }
-        return successfullySent;
-    }
+    public Task<int> SyncPendingReportsAsync(CancellationToken stoppingToken = default) =>
+        _delivery.FlushAsync(stoppingToken);
 
     #endregion
 
@@ -1618,16 +1378,21 @@ public class Worker : BackgroundService
     {
         _logger.LogInformation("👁️ Window Monitor Worker stopping gracefully...");
 
-        // End any active session before stopping
-        if (_currentSession != null)
+        try
         {
-            await EndCurrentSessionAsync();
+            await base.StopAsync(cancellationToken);
+            if (_syncTask != null) await _syncTask.WaitAsync(cancellationToken);
         }
-
-        // Save any pending reports
-        _logger.LogInformation("💾 Saving final reports...");
-
-        await base.StopAsync(cancellationToken);
+        finally
+        {
+            lock (_sessionLock)
+            {
+                _tracking.Stop(DateTime.Now);
+                SavePendingSessions();
+                if (_tracking.UnsavedCount > 0)
+                    _logger.LogError("Shutdown with {Count} unsaved reports because storage is unavailable.", _tracking.UnsavedCount);
+            }
+        }
     }
 
     #endregion

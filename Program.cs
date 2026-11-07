@@ -4,7 +4,9 @@ using Telegram.Bot;
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
 using System.Linq;
+using System.Text.Json;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -82,10 +84,7 @@ if (isPlaceholder || forceSetup)
     var thread = new Thread(() =>
     {
         var app = new Application();
-        var win = new SetupWindow(
-            currentToken.Contains("8509883067:") ? "" : currentToken, 
-            currentChatId == "555437484" ? "" : currentChatId
-        );
+        var win = new SetupWindow(currentToken, currentChatId);
         app.Run(win);
 
         if (win.IsConfigured)
@@ -104,14 +103,9 @@ if (isPlaceholder || forceSetup)
     {
         try
         {
-            string newConfig = $$"""
-{
-  "Telegram": {
-    "BotToken": "{{setupToken}}",
-    "ChatId": "{{setupChat}}"
-  }
-}
-""";
+            string newConfig = JsonSerializer.Serialize(
+                new { Telegram = new { BotToken = setupToken, ChatId = setupChat } },
+                new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(configPath, newConfig);
         }
         catch (Exception ex)
@@ -206,6 +200,12 @@ if (!StartupPersistence.IsInstalled && !skipPersistPrompt)
     }
 }
 
+// Startup folder and registry entries may both launch us. Keep one host per Windows session/user.
+using var instanceMarker = new EventWaitHandle(false, EventResetMode.ManualReset,
+    @"Local\ActivityTracker-" + System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value,
+    out bool isFirstInstance);
+if (!isFirstInstance) return;
+
 // Create the host builder
 var builder = Host.CreateApplicationBuilder(args);
 
@@ -218,11 +218,15 @@ builder.Configuration
     .AddUserSecrets<Program>(optional: true)
     .AddEnvironmentVariables();
 
+// Telegram includes the token in request URLs in both direct and fallback modes.
+builder.Logging.AddFilter("System.Net.Http.HttpClient", LogLevel.None);
+
 // Register services with proper lifecycle
 
 // 1. Singleton services (shared instance)
 builder.Services.AddSingleton<LocalStorageService>();
-builder.Services.AddSingleton<TelegramBotService>();
+builder.Services.AddSingleton<ReportDeliveryService>();
+builder.Services.AddHostedService<DailyDigestService>();
 
 // 2. Register Worker and NotificationWatcher as singletons, then as hosted services
 builder.Services.AddSingleton<Worker>();
@@ -244,7 +248,7 @@ builder.Services.AddSingleton<TelegramUpdateDispatcher>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<TelegramCommandService>());
 
 // HTTP client for outbound activity reports only
-builder.Services.AddHttpClient<TelegramBotService>((serviceProvider, client) =>
+var reportClient = builder.Services.AddHttpClient<TelegramBotService>((serviceProvider, client) =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
     client.DefaultRequestHeaders.Add("User-Agent", "ActivityTracker/1.0");
@@ -308,7 +312,7 @@ try
 }
 catch (Exception ex)
 {
-    logger.LogCritical(ex, "💥 Application terminated unexpectedly");
+    logger.LogCritical("Application terminated unexpectedly ({ErrorType})", ex.GetType().Name);
     throw;
 }
 finally
@@ -490,6 +494,12 @@ public class SetupWindow : Window
 
             BotToken = tokenInput.Text.Trim();
             ChatId = chatIdInput.Text.Trim();
+            if (!System.Text.RegularExpressions.Regex.IsMatch(BotToken, @"^[0-9]+:[A-Za-z0-9_-]{8,}$")
+                || !TelegramAuthorization.IsOwnerChat(ChatId, ChatId))
+            {
+                MessageBox.Show("Enter a valid bot token and your positive private Telegram user ID.", "Validation Error", MessageBoxButton.OK, MessageBoxImage.Warning);
+                return;
+            }
             IsConfigured = true;
             Close();
         };
