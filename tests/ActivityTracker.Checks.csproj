@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="SkiaSharp" Version="4.155.0" />
+    <PackageReference Include="Telegram.Bot" Version="22.10.0.1" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.8" />
+    <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.14" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="10.0.2" />
+    <Compile Include="../Relay/RelaySettings.cs;../Relay/RelayOutbox.cs;../Relay/RelayTransport.cs;../Relay/WebpImages.cs" Link="Relay/%(Filename)%(Extension)" />
+    <Compile Include="../ClipboardHistoryStore.cs;../Telegram/TelegramClipboard.cs;../WindowsLogonSession.cs" Link="%(Filename)%(Extension)" />
+    <Compile Include="../Telegram/TelegramAuthorization.cs" Link="%(Filename)%(Extension)" />
+    <Compile Include="../ActivitySessionTracker.cs;../ReportDeliveryService.cs" Link="%(Filename)%(Extension)" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <Compile Include="../ActivitySummary.cs;../ActivityReport.cs;../AppSession.cs;../SessionTiming.cs;../DailyDigestService.cs;../LocalStorageService.cs;../TelegramBotService.cs;../DurationFormatter.cs;../NotificationReport.cs;../Telegram/TelegramAnalytics.cs;../Telegram/TelegramCallbackData.cs" Link="%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
