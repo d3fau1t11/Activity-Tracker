@@ -18,6 +18,13 @@
   [headers.values]
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "no-referrer"
+    X-Robots-Tag = "noindex, nofollow"
+
+[[redirects]]
+  from = "/"
+  to = "/404.html"
+  status = 404
+  force = true
 
 [[redirects]]
   from = "/api/telegram"

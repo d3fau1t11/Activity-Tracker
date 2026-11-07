@@ -103,6 +103,8 @@ An optional `DeviceName` gives the PC a friendly label of up to 40 characters; t
 
 Deploy the repository to one Netlify Free project with base directory `relay-server`, build command `npm run check`, publish directory `public`, and functions directory `netlify/functions`. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in Netlify's environment-variable UI using the default All scopes, then deploy/publish. There is no per-PC Netlify environment variable. Confirm four functions: `telegram`, `telegram-webhook`, `upload-image`, and `retry-deliveries`.
 
+Opening the site in a browser returns HTTP 404 with a generic Not Found page. The site serves the relay API; it has no public homepage. A 404 at the root is expected and does not indicate an API failure.
+
 Keep all trackers stopped while configuring. Create the ignored local `relay-server/.env` with those two preset values plus `RELAY_SITE_URL`, then run `npm.cmd ci`, `npm.cmd run check:env`, and `npm.cmd run configure` from `relay-server`. The setup installs one authenticated Telegram webhook and drops old pending Telegram updates. Restart the rebuilt Windows apps afterward. The full local setup guide is `relay-server/SETUP.md`.
 
 Send `/devices` to choose a PC; selection opens that PC's menu. `/device` shows the selected PC and `/select <device-ID-or-selector>` changes it. Text commands apply to that selection. Buttons in an existing PC menu stay tied to that PC even after selecting another one. The app registers during its first relay request, normally within a polling interval after startup. The registry supports up to 32 PCs and marks a PC offline after 90 seconds without a request.
