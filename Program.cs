@@ -1,5 +1,6 @@
 using Activity_Tracker;
 using Activity_Tracker.Telegram;
+using Activity_Tracker.Relay;
 using Telegram.Bot;
 using System;
 using System.Diagnostics;
@@ -35,6 +36,15 @@ if (File.Exists(Path.Combine(appDir, "telegram_config.json")) ||
 
 // Setup configuration path (after cwd may point at app output)
 string configPath = Path.Combine(Directory.GetCurrentDirectory(), "telegram_config.json");
+var startupConfig = new ConfigurationBuilder().SetBasePath(Directory.GetCurrentDirectory())
+    .AddJsonFile("appsettings.json", optional: true).AddJsonFile("telegram_config.json", optional: true)
+    .AddEnvironmentVariables().Build();
+var relaySettings = RelaySettings.Read(startupConfig);
+if (args.Contains("--relay-login"))
+{
+    MessageBox.Show("No separate relay login is needed. Configure the Telegram bot token, private chat ID, and Netlify URL.", "Telegram fallback");
+    return;
+}
 string currentToken = "";
 string currentChatId = "";
 
@@ -218,6 +228,21 @@ builder.Configuration
     .AddUserSecrets<Program>(optional: true)
     .AddEnvironmentVariables();
 
+// The existing Telegram token authenticates direct calls and the Netlify fallback.
+relaySettings = RelaySettings.Read(builder.Configuration);
+if (relaySettings.Enabled)
+{
+    builder.Services.AddSingleton(relaySettings);
+    builder.Services.AddSingleton(new RelayOutbox(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "ActivityTracker", "relay", relaySettings.DeviceId, relaySettings.BotId, relaySettings.ChatId, "outbox")));
+    builder.Services.AddSingleton<RelayTransport>(sp => new RelayTransport(relaySettings,
+        sp.GetRequiredService<RelayOutbox>(), sp.GetRequiredService<ILogger<RelayTransport>>()));
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<RelayTransport>());
+    builder.Services.AddTransient<RelayHttpHandler>();
+    builder.Services.AddHttpClient("telegram-relay", client => client.Timeout = TimeSpan.FromMinutes(2))
+        .ConfigurePrimaryHttpMessageHandler<RelayHttpHandler>();
+}
+
 // Telegram includes the token in request URLs in both direct and fallback modes.
 builder.Logging.AddFilter("System.Net.Http.HttpClient", LogLevel.None);
 
@@ -242,7 +267,8 @@ builder.Services.AddSingleton<ITelegramBotClient>(sp =>
     var config = sp.GetRequiredService<IConfiguration>();
     var token = config["Telegram:BotToken"]
         ?? throw new InvalidOperationException("Telegram:BotToken is missing");
-    return new TelegramBotClient(token);
+    var http = relaySettings.Enabled ? sp.GetRequiredService<IHttpClientFactory>().CreateClient("telegram-relay") : null;
+    return new TelegramBotClient(token, http);
 });
 builder.Services.AddSingleton<TelegramCommandService>();
 builder.Services.AddSingleton<TelegramUpdateDispatcher>();
@@ -252,9 +278,10 @@ builder.Services.AddHostedService<TrayService>();
 // HTTP client for outbound activity reports only
 var reportClient = builder.Services.AddHttpClient<TelegramBotService>((serviceProvider, client) =>
 {
-    client.Timeout = TimeSpan.FromSeconds(30);
+    client.Timeout = relaySettings.Enabled ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(30);
     client.DefaultRequestHeaders.Add("User-Agent", "ActivityTracker/1.0");
 });
+if (relaySettings.Enabled) reportClient.ConfigurePrimaryHttpMessageHandler<RelayHttpHandler>();
 
 // Add logging configuration (no console — app runs headless in background)
 builder.Logging.ClearProviders();

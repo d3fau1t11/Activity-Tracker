@@ -34,6 +34,7 @@
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.2" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.2" />
     <PackageReference Include="Microsoft.Extensions.Http" Version="10.0.2" />
+    <PackageReference Include="SkiaSharp" Version="4.155.0" />
     <PackageReference Include="Telegram.Bot" Version="22.10.0.1" />
   </ItemGroup>
 </Project>

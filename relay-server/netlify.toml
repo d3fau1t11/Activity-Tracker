@@ -1,0 +1,30 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+  command = "npm run check"
+
+[build.environment]
+  NODE_VERSION = "22"
+
+[functions]
+  node_bundler = "nft"
+  external_node_modules = ["sharp"]
+
+[functions."retry-deliveries"]
+  schedule = "*/5 * * * *"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+
+[[redirects]]
+  from = "/api/telegram"
+  to = "/.netlify/functions/telegram"
+  status = 200
+
+[[redirects]]
+  from = "/api/upload-image"
+  to = "/.netlify/functions/upload-image"
+  status = 200

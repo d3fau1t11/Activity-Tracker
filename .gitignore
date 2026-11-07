@@ -32,3 +32,12 @@ bld/
 # Logs
 *.log
 Logs/
+
+# Relay dependencies and server credentials
+relay-server/node_modules/
+relay-server/.npm-cache/
+relay-server/.netlify/
+relay-server/.env
+relay-server/.env.*
+!relay-server/.env.example
+relay-server/service-account*.json
