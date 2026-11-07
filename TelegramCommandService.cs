@@ -28,11 +28,12 @@ namespace Activity_Tracker
         private readonly ILogger<TelegramCommandService> _logger;
         private readonly Worker _worker;
         private readonly LocalStorageService _storageService;
+        private readonly TelegramBotService _reports;
+        private readonly ClipboardHistoryService _clipboard;
         private readonly ITelegramBotClient _botClient;
         private readonly IServiceProvider _serviceProvider;
         private readonly IHostApplicationLifetime _hostApplicationLifetime;
         private readonly string _chatId;
-        private readonly bool _allowMultipleUsers;
 
         private readonly object _lock = new();
         private CancellationTokenSource? _pollingCts;
@@ -45,6 +46,8 @@ namespace Activity_Tracker
             ILogger<TelegramCommandService> logger,
             Worker worker,
             LocalStorageService storageService,
+            TelegramBotService reports,
+            ClipboardHistoryService clipboard,
             ITelegramBotClient botClient,
             IServiceProvider serviceProvider,
             IConfiguration configuration,
@@ -53,6 +56,8 @@ namespace Activity_Tracker
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _worker = worker ?? throw new ArgumentNullException(nameof(worker));
             _storageService = storageService ?? throw new ArgumentNullException(nameof(storageService));
+            _reports = reports;
+            _clipboard = clipboard;
             _botClient = botClient ?? throw new ArgumentNullException(nameof(botClient));
             _serviceProvider = serviceProvider ?? throw new ArgumentNullException(nameof(serviceProvider));
             _hostApplicationLifetime = hostApplicationLifetime ?? throw new ArgumentNullException(nameof(hostApplicationLifetime));
@@ -60,13 +65,15 @@ namespace Activity_Tracker
             _chatId = configuration["Telegram:ChatId"]
                 ?? throw new InvalidOperationException("Telegram:ChatId is missing");
 
-            _allowMultipleUsers = configuration.GetValue("Telegram:AllowMultipleUsers", false);
 
             _logger.LogInformation("⌨️ Telegram Command Service initialized");
         }
 
         public bool IsAuthorized(string chatId) =>
-            _allowMultipleUsers || chatId == _chatId;
+            TelegramAuthorization.IsOwnerChat(_chatId, chatId);
+
+        public bool IsAuthorized(long chatId, long actorId, ChatType chatType) =>
+            TelegramAuthorization.IsAuthorized(_chatId, chatId, actorId, chatType);
 
         #endregion
 
@@ -90,7 +97,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to determine if running in active console session");
+                _logger.LogWarning("Failed to determine if running in active console session ({ErrorType})", ex.GetType().Name);
                 return true; // Fallback to true to ensure it works
             }
         }
@@ -187,7 +194,7 @@ namespace Activity_Tracker
 
         private Task HandlePollingErrorAsync(ITelegramBotClient bot, Exception exception, CancellationToken cancellationToken)
         {
-            _logger.LogError(exception, "❌ Telegram polling error");
+            _logger.LogError("❌ Telegram polling error ({ErrorType})", exception.GetType().Name);
             return Task.CompletedTask;
         }
 
@@ -200,6 +207,25 @@ namespace Activity_Tracker
         /// </summary>
         public async Task ProcessTextCommandAsync(string chatId, string userName, string text, CancellationToken cancellationToken)
         {
+            if (!IsAuthorized(chatId)) return;
+            if (TelegramClipboard.IsCommand(text))
+            {
+                if (!IsAuthorized(chatId)) return;
+                if (TelegramClipboard.TryParseCommand(text, out var request))
+                    await HandleClipboardAsync(chatId, request, cancellationToken);
+                else await SendPlainMessageAsync(TelegramClipboard.Usage, chatId, cancellationToken);
+                return;
+            }
+            if (TelegramAnalytics.IsCommand(text))
+            {
+                if (!IsAuthorized(chatId)) return;
+                if (TelegramAnalytics.TryParseCommand(text, DateTime.Today, out var request))
+                    await HandleAnalyticsAsync(chatId, request, cancellationToken);
+                else
+                    await SendPlainMessageAsync(TelegramAnalytics.Usage, chatId, cancellationToken);
+                return;
+            }
+
             // Intercept /kill command with arguments
             if (text.StartsWith("/kill", StringComparison.OrdinalIgnoreCase))
             {
@@ -354,6 +380,70 @@ namespace Activity_Tracker
 
         #region Command Handlers
 
+        public async Task HandleClipboardAsync(string chatId, ClipboardRequest request,
+            CancellationToken cancellationToken, int? messageId = null)
+        {
+            if (!IsAuthorized(chatId)) return;
+            try
+            {
+                if (!_clipboard.Available)
+                {
+                    await SendPlainMessageAsync(_clipboard.Error ?? "Clipboard history is not available yet. Check the local tray.", chatId, cancellationToken);
+                    return;
+                }
+                if (request.Action == "clear") await Task.Run(_clipboard.Clear, cancellationToken);
+                if (request.Action == "item")
+                {
+                    var item = await Task.Run(() => _clipboard.Read(request.ItemId), cancellationToken);
+                    if (item == null)
+                        await SendPlainMessageAsync("That item has expired or was cleared. Open /clipboard for the current history.", chatId, cancellationToken);
+                    else if (item.Info.Kind == ClipboardItemKind.Image && item.Png != null)
+                    {
+                        using var stream = new MemoryStream(item.Png);
+                        await _botClient.SendDocument(chatId, InputFile.FromStream(stream, $"clipboard-{item.Info.Id:N}.png"),
+                            caption: $"Clipboard image · {item.Info.CapturedAt:yyyy-MM-dd HH:mm:ss}", cancellationToken: cancellationToken);
+                    }
+                    else if (item.Text != null)
+                        await SendPlainMessageAsync($"Clipboard text · {item.Info.CapturedAt:yyyy-MM-dd HH:mm:ss}\n\n{item.Text}", chatId, cancellationToken);
+                    return;
+                }
+                var view = TelegramClipboard.Build(_clipboard.List(), _clipboard.Enabled, request.Page);
+                var keyboard = new InlineKeyboardMarkup(view.Buttons.Select(row => row.Select(button =>
+                    InlineKeyboardButton.WithCallbackData(button.Text, button.Callback))));
+                if (messageId.HasValue) await EditMenuAsync(chatId, messageId.Value, view.Html, keyboard, cancellationToken);
+                else await SendUiMessageAsync(view.Html, chatId, keyboard, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError("Could not retrieve clipboard history ({ErrorType})", ex.GetType().Name);
+                await SendPlainMessageAsync("Clipboard history could not be loaded. Check the local tray or try again.", chatId, cancellationToken);
+            }
+        }
+
+        public async Task HandleAnalyticsAsync(string chatId, AnalyticsRequest request,
+            CancellationToken cancellationToken, int? messageId = null)
+        {
+            if (!IsAuthorized(chatId)) return;
+            try
+            {
+                var view = await Task.Run(() => TelegramAnalytics.Build(_storageService.GetReportHistory(),
+                    request, DateTime.Today, _reports.FormatWindowTitle), cancellationToken);
+                var keyboard = new InlineKeyboardMarkup(view.Buttons.Select(row => row.Select(button =>
+                    InlineKeyboardButton.WithCallbackData(button.Text, button.Callback))));
+                if (messageId.HasValue)
+                    await EditMenuAsync(chatId, messageId.Value, view.Html, keyboard, cancellationToken);
+                else
+                    await SendUiMessageAsync(view.Html, chatId, keyboard, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogError("Could not load activity analytics ({ErrorType})", ex.GetType().Name);
+                await SendPlainMessageAsync("Activity analytics could not be loaded. Try /analytics again shortly.", chatId, cancellationToken);
+            }
+        }
+
         /// <summary>
         /// Handles /help and /start commands
         /// </summary>
@@ -366,7 +456,8 @@ namespace Activity_Tracker
                 I'm <b>Activity Tracker Bot</b> 🕵️‍♂️
 
                 <b>Control:</b> /track /stop /status /whoami /current /persistence
-                <b>Data:</b> /stats /history /pending /notifications /clear
+                <b>Data:</b> /analytics /trends /sessions /clipboard /stats /history /pending /notifications /clear
+                <b>Analytics date:</b> /analytics YYYY-MM-DD (also /trends and /sessions)
                 <b>Utility:</b> /screenshot /webcam /sysinfo /users /processes /lock /sleep /signout
                 <b>Advanced:</b> /msg /open /kill /block /unblock /shutdown
 
@@ -570,7 +661,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error getting pending reports");
+                _logger.LogError("❌ Error getting pending reports ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error retrieving pending reports.", chatId, cancellationToken);
             }
         }
@@ -616,7 +707,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /notifications command");
+                _logger.LogError("❌ Error handling /notifications command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error retrieving notifications.", chatId, cancellationToken);
             }
         }
@@ -643,7 +734,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling signout command");
+                _logger.LogError("❌ Error handling signout command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Failed to execute signout command.", chatId, cancellationToken);
             }
         }
@@ -665,7 +756,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error clearing pending reports");
+                _logger.LogError("❌ Error clearing pending reports ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error clearing pending reports from local storage.", chatId, cancellationToken);
             }
         }
@@ -691,7 +782,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error getting current active window");
+                _logger.LogError("❌ Error getting current active window ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error getting current active window.", chatId, cancellationToken);
             }
         }
@@ -723,7 +814,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error executing screenshot command");
+                _logger.LogError("❌ Error executing screenshot command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ An unexpected error occurred while capturing screen.", chatId, cancellationToken);
             }
         }
@@ -747,7 +838,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /lock command");
+                _logger.LogError("❌ Error handling /lock command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error locking workstation.", chatId, cancellationToken);
             }
         }
@@ -771,7 +862,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /sleep command");
+                _logger.LogError("❌ Error handling /sleep command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error suspending workstation.", chatId, cancellationToken);
             }
         }
@@ -801,7 +892,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /sysinfo command");
+                _logger.LogError("❌ Error handling /sysinfo command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error retrieving system specifications.", chatId, cancellationToken);
             }
         }
@@ -844,7 +935,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /users command");
+                _logger.LogError("❌ Error handling /users command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error retrieving user accounts.", chatId, cancellationToken);
             }
         }
@@ -873,7 +964,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error executing webcam snapshot command");
+                _logger.LogError("❌ Error executing webcam snapshot command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ An unexpected error occurred while capturing webcam snapshot.", chatId, cancellationToken);
             }
         }
@@ -911,7 +1002,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /processes command");
+                _logger.LogError("❌ Error handling /processes command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error retrieving active processes list.", chatId, cancellationToken);
             }
         }
@@ -960,7 +1051,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /kill command");
+                _logger.LogError("❌ Error handling /kill command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ An unexpected error occurred while executing the terminate command.", chatId, cancellationToken);
             }
         }
@@ -1061,7 +1152,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /block command");
+                _logger.LogError("❌ Error handling /block command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error managing blocklist.", chatId, cancellationToken);
             }
         }
@@ -1112,7 +1203,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /unblock command");
+                _logger.LogError("❌ Error handling /unblock command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error updating blocklist.", chatId, cancellationToken);
             }
         }
@@ -1162,7 +1253,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /history command");
+                _logger.LogError("❌ Error handling /history command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Failed to retrieve browser history.", chatId, cancellationToken);
             }
         }
@@ -1190,7 +1281,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /msg command");
+                _logger.LogError("❌ Error handling /msg command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Failed to send remote screen alert.", chatId, cancellationToken);
             }
         }
@@ -1232,7 +1323,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /open command");
+                _logger.LogError("❌ Error handling /open command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Failed to open URL in browser.", chatId, cancellationToken);
             }
         }
@@ -1254,7 +1345,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling shutdown command");
+                _logger.LogError("❌ Error handling shutdown command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Error shutting down application.", chatId, cancellationToken);
             }
         }
@@ -1315,7 +1406,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error handling /persistence command");
+                _logger.LogError("❌ Error handling /persistence command ({ErrorType})", ex.GetType().Name);
                 await SendMessageAsync("❌ Failed to verify persistence status.", chatId, cancellationToken);
             }
         }
@@ -1354,6 +1445,10 @@ namespace Activity_Tracker
                     new BotCommand { Command = "notifications", Description = "Recent notifications" },
                     new BotCommand { Command = "signout", Description = "Sign out active user session" },
                     new BotCommand { Command = "stats", Description = "Activity statistics" },
+                    new BotCommand { Command = "analytics", Description = "Daily totals and top apps; optional YYYY-MM-DD" },
+                    new BotCommand { Command = "clipboard", Description = "Saved text and images (local opt-in required)" },
+                    new BotCommand { Command = "trends", Description = "Seven-day activity trend; optional YYYY-MM-DD" },
+                    new BotCommand { Command = "sessions", Description = "Session history; optional YYYY-MM-DD and page" },
                     new BotCommand { Command = "help", Description = "Command reference" },
                 };
                 await _botClient.SetMyCommands(commands, cancellationToken: cancellationToken);
@@ -1367,7 +1462,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "⚠️ Failed to register bot commands");
+                _logger.LogWarning("⚠️ Failed to register bot commands ({ErrorType})", ex.GetType().Name);
             }
         }
 
@@ -1399,7 +1494,11 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogDebug(ex, "EditMessageText failed, sending new menu message");
+                if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested) throw;
+                // Refreshing an unchanged view should not create another message.
+                if (ex is global::Telegram.Bot.Exceptions.ApiRequestException api && api.ErrorCode == 400
+                    && api.Message.Contains("message is not modified", StringComparison.OrdinalIgnoreCase)) return;
+                _logger.LogDebug("EditMessageText failed, sending new menu message ({ErrorType})", ex.GetType().Name);
                 await SendUiMessageAsync(htmlText, chatId, keyboard, cancellationToken);
             }
         }
@@ -1415,7 +1514,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error sending plain Telegram message");
+                _logger.LogError("❌ Error sending plain Telegram message ({ErrorType})", ex.GetType().Name);
             }
         }
 
@@ -1441,7 +1540,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error sending UI Telegram message");
+                _logger.LogError("❌ Error sending UI Telegram message ({ErrorType})", ex.GetType().Name);
             }
         }
 
@@ -1460,7 +1559,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error sending Telegram message");
+                _logger.LogError("❌ Error sending Telegram message ({ErrorType})", ex.GetType().Name);
             }
         }
 
@@ -1476,7 +1575,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error sending Telegram HTML message");
+                _logger.LogError("❌ Error sending Telegram HTML message ({ErrorType})", ex.GetType().Name);
             }
         }
 
@@ -1494,7 +1593,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error sending Telegram photo");
+                _logger.LogError("❌ Error sending Telegram photo ({ErrorType})", ex.GetType().Name);
             }
         }
 
@@ -1533,7 +1632,7 @@ namespace Activity_Tracker
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "❌ Error sending welcome message");
+                _logger.LogError("❌ Error sending welcome message ({ErrorType})", ex.GetType().Name);
             }
         }
 

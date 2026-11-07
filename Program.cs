@@ -226,6 +226,7 @@ builder.Logging.AddFilter("System.Net.Http.HttpClient", LogLevel.None);
 // 1. Singleton services (shared instance)
 builder.Services.AddSingleton<LocalStorageService>();
 builder.Services.AddSingleton<ReportDeliveryService>();
+builder.Services.AddSingleton<ClipboardHistoryService>();
 builder.Services.AddHostedService<DailyDigestService>();
 
 // 2. Register Worker and NotificationWatcher as singletons, then as hosted services
@@ -246,6 +247,7 @@ builder.Services.AddSingleton<ITelegramBotClient>(sp =>
 builder.Services.AddSingleton<TelegramCommandService>();
 builder.Services.AddSingleton<TelegramUpdateDispatcher>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<TelegramCommandService>());
+builder.Services.AddHostedService<TrayService>();
 
 // HTTP client for outbound activity reports only
 var reportClient = builder.Services.AddHttpClient<TelegramBotService>((serviceProvider, client) =>

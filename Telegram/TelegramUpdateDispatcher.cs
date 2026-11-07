@@ -46,14 +46,13 @@ public class TelegramUpdateDispatcher
         var userName = message.From.Username ?? message.From.FirstName ?? "User";
         var text = message.Text!.Trim();
 
-        _logger.LogInformation("📩 Command from {User}: {Command}", userName, text);
-
-        if (!_commands.IsAuthorized(chatId))
+        if (!_commands.IsAuthorized(message.Chat.Id, message.From.Id, message.Chat.Type))
         {
-            _logger.LogWarning("🚫 Unauthorized access attempt from chat ID: {ChatId}", chatId);
-            await _commands.SendPlainMessageAsync("⛔ You are not authorized to use this bot.", chatId, cancellationToken);
+            _logger.LogWarning("Rejected unauthorized Telegram message");
             return;
         }
+
+        _logger.LogInformation("Received authorized Telegram command");
 
         var lower = text.ToLowerInvariant();
         if (lower is "/start" or "/menu")
@@ -78,16 +77,40 @@ public class TelegramUpdateDispatcher
         var userName = callback.From.Username ?? callback.From.FirstName ?? "User";
         var messageId = callback.Message.MessageId;
 
-        if (!_commands.IsAuthorized(chatId))
+        if (!_commands.IsAuthorized(callback.Message.Chat.Id, callback.From.Id, callback.Message.Chat.Type))
         {
             await AnswerCallbackSafeAsync(callback.Id, "Not authorized", cancellationToken);
             return;
         }
 
-        _logger.LogInformation("🔘 Callback from {User}: {Data}", userName, data);
+        _logger.LogInformation("Received authorized Telegram callback");
 
         try
         {
+            if (data.StartsWith("clip:", StringComparison.Ordinal))
+            {
+                if (!TelegramClipboard.TryParseCallback(data, out var request))
+                {
+                    await AnswerCallbackSafeAsync(callback.Id, "Invalid selection. Open /clipboard again.", cancellationToken);
+                    return;
+                }
+                await AnswerCallbackSafeAsync(callback.Id, cancellationToken);
+                await _commands.HandleClipboardAsync(chatId, request, cancellationToken, messageId);
+                return;
+            }
+
+            if (data.StartsWith("an:", StringComparison.Ordinal))
+            {
+                if (!TelegramAnalytics.TryParseCallback(data, DateTime.Today, out var request))
+                {
+                    await AnswerCallbackSafeAsync(callback.Id, "Invalid analytics selection. Open /analytics again.", cancellationToken);
+                    return;
+                }
+                await AnswerCallbackSafeAsync(callback.Id, cancellationToken);
+                await _commands.HandleAnalyticsAsync(chatId, request, cancellationToken, messageId);
+                return;
+            }
+
             switch (data)
             {
                 case TelegramCallbackData.NavMain:
@@ -233,7 +256,7 @@ public class TelegramUpdateDispatcher
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Error handling callback {Data}", data);
+            _logger.LogError("Error handling Telegram callback ({ErrorType})", ex.GetType().Name);
             await AnswerCallbackSafeAsync(callback.Id, "Error", cancellationToken);
         }
     }
@@ -252,7 +275,7 @@ public class TelegramUpdateDispatcher
         }
         catch (Exception ex)
         {
-            _logger.LogDebug(ex, "AnswerCallbackQuery failed");
+            _logger.LogDebug("AnswerCallbackQuery failed ({ErrorType})", ex.GetType().Name);
         }
     }
 }

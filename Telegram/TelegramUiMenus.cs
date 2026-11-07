@@ -23,6 +23,11 @@ public static class TelegramUiMenus
         },
         new[]
         {
+            InlineKeyboardButton.WithCallbackData("📊 Analytics", TelegramCallbackData.Analytics),
+            InlineKeyboardButton.WithCallbackData("📋 Clipboard", TelegramCallbackData.Clipboard),
+        },
+        new[]
+        {
             InlineKeyboardButton.WithCallbackData("📸 Screenshot", TelegramCallbackData.Screenshot),
             InlineKeyboardButton.WithCallbackData("🔔 Notifications", TelegramCallbackData.Notifications),
         },
@@ -100,7 +105,10 @@ public static class TelegramUiMenus
         <b>❓ Help</b>
 
         <b>Control:</b> Track, Stop, Status, Current
-        <b>Data:</b> Stats, Pending, Clear
+        <b>Data:</b> Analytics, Clipboard, Stats, Pending, Clear
+        <b>Clipboard:</b> <code>/clipboard</code> (requires local opt-in)
+        <b>Analytics:</b> <code>/analytics</code> <code>/trends</code> <code>/sessions</code>
+        Add a date, e.g. <code>/analytics 2026-11-06</code>.
         <b>Utility:</b> Screenshot, Webcam, Sysinfo, Lock, Sleep
         <b>Advanced (slash only):</b>
         <code>/kill</code> <code>/block</code> <code>/msg</code> <code>/open</code> <code>/history</code>

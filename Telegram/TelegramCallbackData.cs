@@ -17,6 +17,8 @@ public static class TelegramCallbackData
     public const string Current = "c:current";
 
     // Data
+    public const string Analytics = "an:today";
+    public const string Clipboard = "clip:list:0";
     public const string Stats = "d:stats";
     public const string Pending = "d:pending";
     public const string Notifications = "d:notifs";

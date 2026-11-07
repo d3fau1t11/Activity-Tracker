@@ -195,9 +195,9 @@ namespace Activity_Tracker
                 };
 
                 _storageService.SaveNotification(report);
-                _logger.LogInformation("🔔 Captured Notification from {App}: {Title} - {Message}", appName, title, message);
+                _logger.LogInformation("Captured a notification from {App}", appName);
 
-                string telegramMsg = $"🔔 <b>Notification: [{appName}]</b>\n\n<b>{title}</b>\n{message}";
+                string telegramMsg = $"🔔 <b>Notification: [{System.Net.WebUtility.HtmlEncode(appName)}]</b>\n\n<b>{System.Net.WebUtility.HtmlEncode(title)}</b>\n{System.Net.WebUtility.HtmlEncode(message)}";
                 await _telegramService.SendSystemNotificationAsync(telegramMsg);
             }
             catch (Exception ex)
