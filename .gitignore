@@ -41,3 +41,5 @@ relay-server/.env
 relay-server/.env.*
 !relay-server/.env.example
 relay-server/service-account*.json
+SECURITY_REVIEW.md
+relay-server/SETUP.md
