@@ -51,6 +51,7 @@ public class TelegramUpdateDispatcher
             _logger.LogWarning("Rejected unauthorized Telegram message");
             return;
         }
+        if (_commands.UsesSharedBot && !TelegramAuthorization.IsFresh(message.Date, DateTime.UtcNow)) return;
 
         _logger.LogInformation("Received authorized Telegram command");
 
@@ -82,6 +83,7 @@ public class TelegramUpdateDispatcher
             await AnswerCallbackSafeAsync(callback.Id, "Not authorized", cancellationToken);
             return;
         }
+        if (_commands.UsesSharedBot && !TelegramAuthorization.IsFresh(callback.Message.Date, DateTime.UtcNow)) return;
 
         _logger.LogInformation("Received authorized Telegram callback");
 
@@ -232,7 +234,11 @@ public class TelegramUpdateDispatcher
                     // Handle whoami callbacks
                     if (data.StartsWith("whoami_"))
                     {
-                        if (data.StartsWith("whoami_confirmed_"))
+                        if (data == "whoami_confirmed")
+                        {
+                            await AnswerCallbackSafeAsync(callback.Id, "Confirmed", cancellationToken);
+                        }
+                        else if (data.StartsWith("whoami_confirmed_"))
                         {
                             var username = data.Replace("whoami_confirmed_", "");
                             await AnswerCallbackSafeAsync(callback.Id, $"Confirmed: {username}", cancellationToken);

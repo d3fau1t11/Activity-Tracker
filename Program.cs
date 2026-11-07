@@ -36,10 +36,6 @@ if (File.Exists(Path.Combine(appDir, "telegram_config.json")) ||
 
 // Setup configuration path (after cwd may point at app output)
 string configPath = Path.Combine(Directory.GetCurrentDirectory(), "telegram_config.json");
-var startupConfig = new ConfigurationBuilder().SetBasePath(Directory.GetCurrentDirectory())
-    .AddJsonFile("appsettings.json", optional: true).AddJsonFile("telegram_config.json", optional: true)
-    .AddEnvironmentVariables().Build();
-var relaySettings = RelaySettings.Read(startupConfig);
 if (args.Contains("--relay-login"))
 {
     MessageBox.Show("No separate relay login is needed. Configure the Telegram bot token, private chat ID, and Netlify URL.", "Telegram fallback");
@@ -229,7 +225,8 @@ builder.Configuration
     .AddEnvironmentVariables();
 
 // The existing Telegram token authenticates direct calls and the Netlify fallback.
-relaySettings = RelaySettings.Read(builder.Configuration);
+var relaySettings = RelaySettings.Read(builder.Configuration).ResolveIdentity(Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ActivityTracker", "relay", "identity"));
 if (relaySettings.Enabled)
 {
     builder.Services.AddSingleton(relaySettings);

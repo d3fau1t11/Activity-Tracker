@@ -8,7 +8,7 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "check": "node --check netlify/functions/telegram.mjs && node --check netlify/functions/retry-deliveries.mjs && node --check netlify/functions/upload-image.mjs",
+    "check": "node --check netlify/functions/telegram.mjs && node --check netlify/functions/telegram-webhook.mjs && node --check netlify/functions/retry-deliveries.mjs && node --check netlify/functions/upload-image.mjs",
     "configure": "node --env-file=.env scripts/configure.mjs",
     "check:env": "node --env-file=.env scripts/check-environment.mjs",
     "bundle:check": "node scripts/check-bundle.mjs"

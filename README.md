@@ -7,6 +7,7 @@ A Windows-based activity monitoring application that tracks application usage an
 - **Window Monitoring**: Tracks active windows and application usage in real-time
 - **Session Tracking**: Records duration of each application/window session
 - **Telegram Integration**: Sends activity reports to your Telegram bot
+- **Multiple PCs with One Bot**: Automatic device identities, PC selection, and separate command queues
 - **Remote Control**: Control tracking via Telegram commands
 - **Multi-User Support**: Works for all Windows accounts on the system
 - **Offline Storage**: Stores reports locally when offline, syncs when connection restored
@@ -77,13 +78,42 @@ This requires administrator privileges and installs:
 
 ## Configuration
 
-### Optional Netlify fallback
+### Shared Telegram bot, multiple PCs, and Netlify fallback
 
-With fallback enabled, the app tries Telegram directly first. If that connection fails, it routes messages, reports, requested images, and command polling through Netlify. The existing bot token authenticates both routes, and the configured private chat and device limit access. Netlify Free functions and private Blobs storage handle queued fallback deliveries without Firebase or a billing account.
+Multiple PCs can use the same preset Telegram bot token and private user/chat ID. Keep those credentials in ignored local configuration and set the same two values on Netlify. Each PC automatically creates a stable installation ID when `DeviceId` is `auto`. Restarting, changing networks, or renaming the PC does not replace that ID. Copy the application and configuration to other PCs while keeping each PC's own identity folder in `%APPDATA%/ActivityTracker/relay/identity`.
 
-Fallback is disabled by default. Deploy the Netlify source, configure the same bot token/chat/device on both sides, remove any Telegram webhook through the setup script, and enable the Relay section in Windows settings. The local setup guide is `relay-server/SETUP.md`. No separate login is needed. The Windows app must be running to execute commands or capture images; clipboard collection still requires local opt-in.
+Add this section to the `appsettings.json` beside the runnable Windows app:
 
-Images become WebP on the PC; Telegram photo requests receive JPEG previews and requested image documents remain WebP. Healthy direct traffic does not use Netlify. Fallback polls every 30 seconds and probes direct access again after 60 seconds; cloud retries and cleanup run every five minutes. Encrypted receipts preserve normal retry ownership across recovery. A timed-out request already accepted by Telegram can still duplicate during failover. Netlify Free quotas can pause service.
+```json
+{
+  "Relay": {
+    "Enabled": true,
+    "SharedBot": true,
+    "BaseUrl": "https://your-site.netlify.app",
+    "DeviceId": "auto",
+    "PollSeconds": 60,
+    "DirectTimeoutSeconds": 8,
+    "RecoverySeconds": 60,
+    "LocalRetentionDays": 7
+  }
+}
+```
+
+An optional `DeviceName` gives the PC a friendly label of up to 40 characters; the default is its computer name. Leave `DeviceId` as `auto` on each PC, or give every PC a distinct explicit ID. An ID already claimed by another installation is rejected. Registrations use the preset bot credential, so the token holder can register devices without a separate login.
+
+Deploy the repository to one Netlify Free project with base directory `relay-server`, build command `npm run check`, publish directory `public`, and functions directory `netlify/functions`. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in Netlify's environment-variable UI using the default All scopes, then deploy/publish. There is no per-PC Netlify environment variable. Confirm four functions: `telegram`, `telegram-webhook`, `upload-image`, and `retry-deliveries`.
+
+Keep all trackers stopped while configuring. Create the ignored local `relay-server/.env` with those two preset values plus `RELAY_SITE_URL`, then run `npm.cmd ci`, `npm.cmd run check:env`, and `npm.cmd run configure` from `relay-server`. The setup installs one authenticated Telegram webhook and drops old pending Telegram updates. Restart the rebuilt Windows apps afterward. The full local setup guide is `relay-server/SETUP.md`.
+
+Send `/devices` to choose a PC; selection opens that PC's menu. `/device` shows the selected PC and `/select <device-ID-or-selector>` changes it. Text commands apply to that selection. Buttons in an existing PC menu stay tied to that PC even after selecting another one. The app registers during its first relay request, normally within a polling interval after startup. The registry supports up to 32 PCs and marks a PC offline after 90 seconds without a request.
+
+Incoming commands always pass through Netlify's webhook and separate private command queues, preventing PCs from competing for Telegram updates. Each PC polls its queue every 30 seconds by default. Commands expire after two minutes and are checked again before execution; acknowledged commands survive restart without replay. A PC crash after executing a command but before acknowledgement can still repeat it. Repeated webhook delivery keeps its original target and command sequence.
+
+Outgoing reports, replies, and requested images try Telegram directly first, then use Netlify on temporary failures. Replies carry a PC label when the message size permits it. Captured images become WebP; Telegram photo requests receive JPEG previews and requested image documents stay WebP. Encrypted outbox receipts preserve ordinary retry ownership across recovery. A timed-out send already accepted by Telegram can still duplicate. Cloud retries and cleanup run every five minutes.
+
+Netlify Free functions and private Blobs handle device records, commands, and fallback deliveries without Firebase or a billing account. All shared PCs consume the same project's usage allowance, including regular command polls while direct Telegram is healthy. The sample uses a 60-second poll interval to reduce usage; command responses can take about a minute. Monitor the project's credits, including function compute, requests, images, and production deploys. If Netlify is unavailable or paused, incoming commands wait or expire; outgoing direct delivery can continue. Clipboard collection still requires local opt-in on each PC, and the Windows app must be running to execute commands.
+
+Legacy single-PC relay operation remains available with `SharedBot: false` on Windows and `RELAY_MULTI_DEVICE=false` plus a matching `RELAY_DEVICE_ID` on Netlify; its setup removes the webhook. Rebuild and configure all PCs consistently when changing modes.
 
 Edit `appsettings.json` to customize behavior:
 
@@ -316,7 +346,7 @@ dotnet run --project tests/ActivityTracker.Checks.csproj
 python -B tests/support/security_audit.py
 ```
 
-The check harness uses isolated temporary storage, fixture activity, and a fake HTTP handler. It exercises the production session tracker through storage and report delivery, including pause/resume, idle time, clock changes, midnight, interrupted polling, disk errors, offline retries, concurrent sends, cancellation, and archive recovery. It also covers digest scheduling, analytics navigation, message limits, title privacy, clipboard text/image retention, encryption boundaries, sign-in resets, and bot navigation. On Windows, it verifies that the OS sign-in identity can be read consistently. It does not read the live clipboard, start tracking, or contact Telegram.
+The check harness uses isolated temporary storage, fixture activity, and a fake HTTP handler. It exercises the production session tracker through storage and report delivery, including pause/resume, idle time, clock changes, midnight, interrupted polling, disk errors, offline retries, concurrent sends, cancellation, and archive recovery. It also covers digest scheduling, analytics navigation, message limits, title privacy, clipboard text/image retention, encryption boundaries, sign-in resets, and bot navigation. Shared-bot checks cover concurrent PC registration, stable identities, device-bound menu buttons, independent command queues, source-ID resets, acknowledgement recovery, and expiry. On Windows, it verifies that the OS sign-in identity can be read consistently. It does not read the live clipboard, start tracking, or contact Telegram.
 
 ## Contributing
 

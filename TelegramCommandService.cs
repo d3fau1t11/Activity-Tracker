@@ -34,6 +34,7 @@ namespace Activity_Tracker
         private readonly IServiceProvider _serviceProvider;
         private readonly IHostApplicationLifetime _hostApplicationLifetime;
         private readonly string _chatId;
+        private readonly bool _sharedBot;
 
         private readonly object _lock = new();
         private CancellationTokenSource? _pollingCts;
@@ -64,6 +65,7 @@ namespace Activity_Tracker
 
             _chatId = configuration["Telegram:ChatId"]
                 ?? throw new InvalidOperationException("Telegram:ChatId is missing");
+            _sharedBot = configuration.GetValue("Relay:Enabled", false) && configuration.GetValue("Relay:SharedBot", true);
 
 
             _logger.LogInformation("⌨️ Telegram Command Service initialized");
@@ -71,6 +73,8 @@ namespace Activity_Tracker
 
         public bool IsAuthorized(string chatId) =>
             TelegramAuthorization.IsOwnerChat(_chatId, chatId);
+
+        public bool UsesSharedBot => _sharedBot;
 
         public bool IsAuthorized(long chatId, long actorId, ChatType chatType) =>
             TelegramAuthorization.IsAuthorized(_chatId, chatId, actorId, chatType);
@@ -540,7 +544,7 @@ namespace Activity_Tracker
             {
                 new[]
                 {
-                    InlineKeyboardButton.WithCallbackData("✅ Confirmed", $"whoami_confirmed_{currentUserName}")
+                    InlineKeyboardButton.WithCallbackData("✅ Confirmed", "whoami_confirmed")
                 },
                 new[]
                 {
@@ -1451,6 +1455,11 @@ namespace Activity_Tracker
                     new BotCommand { Command = "sessions", Description = "Session history; optional YYYY-MM-DD and page" },
                     new BotCommand { Command = "help", Description = "Command reference" },
                 };
+                if (_sharedBot) commands = commands.Concat(new[] {
+                    new BotCommand { Command = "devices", Description = "Choose a PC" },
+                    new BotCommand { Command = "device", Description = "Show selected PC" },
+                    new BotCommand { Command = "select", Description = "Select a PC by ID" }
+                }).ToArray();
                 await _botClient.SetMyCommands(commands, cancellationToken: cancellationToken);
                 _logger.LogInformation("✅ Telegram bot command menu registered");
             }

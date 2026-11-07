@@ -16,6 +16,10 @@ internal static partial class Program
         Expect(!TelegramAuthorization.IsAuthorized("123", 123, 123, ChatType.Group), "Group commands are rejected.");
         Expect(!TelegramAuthorization.IsAuthorized("", 0, 0, ChatType.Private), "Missing owner configuration fails closed.");
         Expect(!TelegramAuthorization.IsOwnerChat("-123", "-123"), "A group ID cannot be configured as the owner.");
+        var now = DateTime.UtcNow;
+        Expect(TelegramAuthorization.IsFresh(now.AddSeconds(-90), now), "Recently queued commands can execute.");
+        Expect(!TelegramAuthorization.IsFresh(now.AddSeconds(-121), now), "Commands that expire while waiting for execution are rejected.");
+        Expect(!TelegramAuthorization.IsFresh(now.AddSeconds(31), now), "Invalid future command timestamps are rejected.");
 
         using var db = new SqliteConnection("Data Source=:memory:");
         db.Open();

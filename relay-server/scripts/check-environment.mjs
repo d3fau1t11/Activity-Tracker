@@ -1,4 +1,4 @@
-const names = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'RELAY_DEVICE_ID'];
+const names = ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'];
 let failed = false;
 for (const name of names) {
   const present = Boolean(process.env[name]);

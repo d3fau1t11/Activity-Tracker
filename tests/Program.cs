@@ -25,6 +25,7 @@ internal static partial class Program
             CheckTrackingAndReportingAsync().GetAwaiter().GetResult();
             CheckClipboardHistory();
             CheckRelayAsync().GetAwaiter().GetResult();
+            CheckMultiDeviceAsync().GetAwaiter().GetResult();
             Console.WriteLine($"PASS: {_assertions} assertions. No live clipboard reads, tracking, or Telegram sends were performed.");
             return 0;
         }

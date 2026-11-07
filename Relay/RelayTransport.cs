@@ -42,6 +42,7 @@ public sealed class RelayTransport : BackgroundService
         var envelope = await PrepareAsync(request, method, ct);
         if (envelope.Fields.TryGetValue("chat_id", out var chat) && chat.ToString() != _settings.ChatId)
             throw new InvalidDataException("Only the configured private chat is authorized.");
+        if (_settings.SharedBot && Durable.Contains(method)) RelayRouting.Decorate(_settings, envelope.Fields);
         var durable = Durable.Contains(method);
         if (durable) await _deliveries.WaitAsync(ct);
         try
@@ -117,6 +118,14 @@ public sealed class RelayTransport : BackgroundService
 
     private async Task<HttpResponseMessage> SendCoreAsync(RelayEnvelope envelope, CancellationToken ct)
     {
+        if (_settings.SharedBot && envelope.Method == "answerCallbackQuery")
+            return new(HttpStatusCode.OK) { Content = new StringContent("{\"ok\":true,\"result\":true}", Encoding.UTF8, "application/json") };
+        if (_settings.SharedBot && envelope.Method == "getUpdates")
+        {
+            // Only Netlify consumes Telegram updates. Each PC pulls its own command queue.
+            await Task.Delay(TimeSpan.FromSeconds(_settings.PollSeconds), ct);
+            return await SubmitRelayAsync(envelope, 0, ct);
+        }
         var durable = Durable.Contains(envelope.Method);
         if (envelope.Fields.TryGetValue("chat_id", out var queuedChat) && queuedChat.ToString() != _settings.ChatId)
         {
@@ -250,7 +259,8 @@ public sealed class RelayTransport : BackgroundService
         if (Durable.Contains(envelope.Method))
         {
             using var lookup = RelayRequest("/api/telegram");
-            lookup.Content = JsonContent.Create(new { deviceId = _settings.DeviceId, id = envelope.Id,
+            lookup.Content = JsonContent.Create(new { deviceId = _settings.DeviceId, deviceName = _settings.DeviceName,
+                instanceId = _settings.InstanceId, id = envelope.Id,
                 method = "getDelivery", fields = new { }, files = Array.Empty<object>() });
             var previous = await _relay.SendAsync(lookup, ct);
             if (previous.StatusCode != HttpStatusCode.NotFound || previous.Headers.Contains("X-Relay-Stored")) return previous;
@@ -266,6 +276,8 @@ public sealed class RelayTransport : BackgroundService
             {
                 using var upload = RelayRequest("/api/upload-image");
                 upload.Headers.Add("X-Relay-Device", _settings.DeviceId);
+                upload.Headers.Add("X-Relay-Instance", _settings.InstanceId);
+                upload.Headers.Add("X-Relay-Name", Uri.EscapeDataString(_settings.DeviceName));
                 upload.Headers.Add("X-Relay-Delivery", envelope.Id);
                 upload.Headers.Add("X-Relay-Field", file.Field);
                 upload.Headers.Add("X-Relay-Part", part.ToString());
@@ -282,7 +294,8 @@ public sealed class RelayTransport : BackgroundService
                 path = $"devices/{_settings.DeviceId}/uploads/{envelope.Id}/{file.Field}.webp" });
         }
         using var message = RelayRequest("/api/telegram");
-        message.Content = JsonContent.Create(new { deviceId = _settings.DeviceId, id = envelope.Id,
+        message.Content = JsonContent.Create(new { deviceId = _settings.DeviceId, deviceName = _settings.DeviceName,
+            instanceId = _settings.InstanceId, id = envelope.Id,
             method = envelope.Method, fields = envelope.Fields, files, notBefore });
         return await _relay.SendAsync(message, ct);
     }

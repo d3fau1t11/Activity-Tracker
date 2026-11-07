@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { services, authenticate } from '../../src/services.mjs';
+import { services, authenticate, deviceFor } from '../../src/services.mjs';
+import { registerDevice } from '../../src/routing.mjs';
 import { CHUNK_BYTES, MAX_IMAGE_BYTES } from '../../src/images.mjs';
 import { validDeviceId, validDeliveryId, HttpError } from '../../src/policy.mjs';
 import { json, errorResponse } from '../../src/http.mjs';
@@ -27,12 +28,12 @@ return async function handler(request) {
     if (request.method !== 'POST') throw new HttpError(405, 'POST required');
     const service = getServices();
     authenticate(request, service);
-    const { records, bucket, device } = service;
+    const { records, bucket } = service;
     const deviceId = request.headers.get('x-relay-device'), id = request.headers.get('x-relay-delivery');
     const field = request.headers.get('x-relay-field');
     if (!validDeviceId(deviceId) || !validDeliveryId(id) || !['photo', 'document'].includes(field))
       throw new HttpError(400, 'Invalid image destination');
-    if (deviceId !== device.deviceId) throw new HttpError(403, 'Device not authorized');
+    const device = deviceFor(service, deviceId);
     const integerHeader = name => {
       const value = request.headers.get(name);
       if (!/^(0|[1-9][0-9]{0,8})$/.test(value || '')) throw new HttpError(400, 'Invalid chunk headers');
@@ -47,6 +48,12 @@ return async function handler(request) {
     const data = await readChunk(request, Math.min(CHUNK_BYTES, bytes - part * CHUNK_BYTES));
     if (part === 0 && (data.toString('ascii', 0, 4) !== 'RIFF' || data.toString('ascii', 8, 12) !== 'WEBP'))
       throw new HttpError(400, 'WebP image required');
+    if (service.sharedBot) {
+      let name;
+      try { name = decodeURIComponent(request.headers.get('x-relay-name') || ''); }
+      catch { throw new HttpError(400, 'Invalid device name'); }
+      await registerDevice(records, device, request.headers.get('x-relay-instance'), name);
+    }
     const path = `devices/${deviceId}/uploads/${id}/${field}.webp`;
     const manifest = { bytes, parts, sha256 };
     const key = 'media/' + createHash('sha256').update(path).digest('hex');

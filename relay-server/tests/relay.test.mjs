@@ -202,11 +202,50 @@ test('private WebP originals remain documents while photo mode creates a JPEG pr
   }
 });
 
+test('shared-PC image uploads register header identities and keep bytes, jobs, and recipients separate', async () => {
+  const f = fixture(); f.sharedBot = true;
+  const data = await webp(), upload = uploadHandler(() => f);
+  const identities = [
+    { deviceId, deviceName: 'Office PC', instanceId: '1'.repeat(32) },
+    { deviceId: 'other-pc', deviceName: 'Home PC', instanceId: '2'.repeat(32) }
+  ];
+  for (const identity of identities) {
+    const headers = { 'x-relay-device': identity.deviceId, 'x-relay-instance': identity.instanceId,
+      'x-relay-name': encodeURIComponent(identity.deviceName) };
+    assert.equal((await upload(uploadRequest(data, data, headers))).status, 200);
+    const imagePath = `devices/${identity.deviceId}/uploads/${id}/photo.webp`;
+    assert.deepEqual((await f.bucket.file(imagePath).download())[0], data);
+    const body = envelope({ ...identity, method: 'sendPhoto',
+      fields: { chat_id: '123', photo: 'attach://photo' },
+      files: [{ field: 'photo', name: 'image.webp', contentType: 'image/webp', path: imagePath }] });
+    const send = telegramHandler(() => f, async job => {
+      assert.equal(job.deviceId, identity.deviceId);
+      assert.deepEqual((await f.bucket.file(job.files[0].path).download())[0], data);
+      return senderOk();
+    });
+    assert.equal((await send(request(body))).status, 200);
+    assert.equal((await f.records.get(jobKey(identity.deviceId, id))).state, 'delivered');
+    assert.equal((await send(request({ ...body, fields: { ...body.fields, chat_id: '456' } }))).status, 403);
+    assert.equal((await send(request({ ...body, files: [{ ...body.files[0],
+      path: `devices/foreign-pc/uploads/${id}/photo.webp` }] }))).status, 400);
+  }
+  const registry = await f.records.get('routing/123_123');
+  assert.equal(Object.keys(registry.devices).length, 2);
+  assert.equal(registry.devices[deviceId].name, 'Office PC');
+  assert.equal((await upload(uploadRequest(data, data, {
+    'x-relay-instance': '2'.repeat(32), 'x-relay-name': 'Collision' }))).status, 409);
+  f.device.chatId = '456';
+  assert.equal((await upload(uploadRequest(data, data, {
+    'x-relay-instance': '1'.repeat(32), 'x-relay-name': 'Office%20PC' }))).status, 409);
+  assert.deepEqual((await f.bucket.file(path).download())[0], data);
+});
+
 test('date-indexed cleanup removes expired private images and records without an external database', async () => {
   const f = fixture(), data = await webp(), now = Date.now();
   await uploadHandler(() => f)(uploadRequest(data));
   const mediaKey = [...f.store.data.keys()].find(key => key.startsWith('media/'));
   const media = await f.records.get(mediaKey);
+  await f.records.set(mediaKey, { ...media, expiresAt: now - 1 });
   await f.records.expire(mediaKey, now - 1, { path: media.path, parts: media.parts });
   await f.records.set('jobs/expired', { expiresAt: now - 1 }); await f.records.expire('jobs/expired', now - 1);
   await f.records.set('jobs/current', { expiresAt: now + 100000 }); await f.records.expire('jobs/current', now + 100000);

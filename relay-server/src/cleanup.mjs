@@ -12,6 +12,12 @@ export async function cleanupExpired(records, bucket, now = Date.now(), deadline
         if (Date.now() >= deadline || removed >= 25) return removed;
         const entry = await records.get(blob.key);
         if (!entry || entry.expiresAt > now) continue;
+        const current = await records.get(entry.key);
+        if (current && current.expiresAt > now) {
+          // A heartbeat or reused update ID renewed this record after the index was written.
+          await records.delete(blob.key);
+          continue;
+        }
         if (entry.image) await bucket.remove(entry.image.path, entry.image.parts);
         await records.delete(entry.key);
         if (entry.key.startsWith('jobs/')) await records.delete(pendingKey(entry.key));

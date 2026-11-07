@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { services, authenticate } from '../../src/services.mjs';
+import { services, authenticate, deviceFor, webhookSecret } from '../../src/services.mjs';
+import { registerDevice, pollCommands } from '../../src/routing.mjs';
 import { durableMethods, validateEnvelope, authorizedUpdate, HttpError } from '../../src/policy.mjs';
 import { enqueue, deliver, deliveryResponse, jobKey } from '../../src/delivery.mjs';
 import { callTelegram } from '../../src/telegram.mjs';
@@ -11,13 +12,18 @@ return async function handler(request) {
     const service = getServices();
     authenticate(request, service);
     const body = await readBody(request);
-    const { records, bucket, device } = service;
+    const { records, bucket } = service;
+    const device = deviceFor(service, body?.deviceId);
     const envelope = validateEnvelope(body, device);
     if (envelope.method === 'configureRelay') {
-      // A webhook would prevent direct polling. Remove it through Netlify.
-      const result = await sender({ method: 'deleteWebhook', fields: { drop_pending_updates: true }, files: [] }, bucket);
+      const fields = service.sharedBot ? {
+        url: new URL('/api/telegram-webhook', request.url).href, secret_token: webhookSecret(service.token),
+        allowed_updates: ['message', 'callback_query'], max_connections: 1, drop_pending_updates: true
+      } : { drop_pending_updates: true };
+      const result = await sender({ method: service.sharedBot ? 'setWebhook' : 'deleteWebhook', fields, files: [] }, bucket);
       return json(result.body, result.status);
     }
+    if (service.sharedBot) await registerDevice(records, device, body.instanceId, body.deviceName);
     if (envelope.method === 'getDelivery') {
       const job = await records.get(jobKey(envelope.deviceId, envelope.id));
       if (!job) throw new HttpError(404, 'Delivery not found');
@@ -27,8 +33,9 @@ return async function handler(request) {
       return json(response.body, response.status, true);
     }
     if (envelope.method === 'getUpdates') {
-      const offset = Number(envelope.fields.offset || 0);
+      const offset = Number(envelope.fields.offset ?? 0);
       if (!Number.isSafeInteger(offset) || offset < 0) throw new HttpError(400, 'Invalid offset');
+      if (service.sharedBot) return json({ ok: true, result: await pollCommands(records, device, offset) });
       // Only the PC initiates polling; Netlify never runs a second polling loop.
       const result = await sender({ ...envelope, fields: { ...envelope.fields, offset, timeout: 0, limit: 100 } }, bucket);
       if (result.body.ok && Array.isArray(result.body.result)) {
